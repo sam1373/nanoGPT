@@ -1,10 +1,10 @@
 """
-Full definition of a GPT Language Model, all of it in this single file.
+Full definition of a GPT Language Model with nGPT option integrated.
 References:
 1) the official GPT-2 TensorFlow implementation released by OpenAI:
-https://github.com/openai/gpt-2/blob/master/src/model.py
+   https://github.com/openai/gpt-2/blob/master/src/model.py
 2) huggingface/transformers PyTorch implementation:
-https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
+   https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
 """
 
 import math
@@ -90,6 +90,15 @@ class CausalSelfAttention(nn.Module):
             # D.R. making it just a parameter so that FA checkpoints are compatible with non-FA checkpoints
             self.bias = torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size)
 
+        if config.use_nGPT == 1:
+            self.sqk_init_value = 1.0
+            self.sqk_init_scaling = config.base_scale
+            self.sqk = nn.Parameter(self.sqk_init_scaling * torch.ones(config.n_embd, dtype=torch.float16))
+
+    def justnorm(self, x):
+        res = x / x.norm(p=2, dim=-1, keepdim=True)
+        return res
+
     def forward(self, x, collect_info=False):
         B, T, C = x.size()  # Batch size, sequence length, embedding dimensionality (n_embd)
 
@@ -98,6 +107,11 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # Shape: (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # Shape: (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # Shape: (B, nh, T, hs)
+
+        if self.config.use_nGPT == 1:
+            sqk = (self.sqk * (self.sqk_init_value / self.sqk_init_scaling)).view(1, self.n_head, 1, C // self.n_head)
+            q = sqk * self.justnorm(q)
+            k = sqk * self.justnorm(k)
 
         if self.config.pe == 'rope':
             # This call expects shape [seq_length, ..., dim]
@@ -222,37 +236,34 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.gelu    = nn.GELU()
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
-        self.dropout = nn.Dropout(config.dropout)
+        self.config = config
+        if config.use_nGPT == 1:
+            self.c_fc = nn.Linear(config.n_embd, 2 * 4 * config.n_embd, bias=config.bias)
+            self.silu = nn.SiLU()
+            self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+            self.suv_init_value = 1.0
+            self.suv_init_scaling = 1.0
+            self.suv = nn.Parameter(self.suv_init_scaling * torch.ones(2 * 4 * config.n_embd, dtype=torch.float16))
+        else:
+            self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+            self.gelu    = nn.GELU()
+            self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+            self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
-        x = self.dropout(x)
-        return x
-
-class Block(nn.Module):
-
-    def __init__(self, config):
-        super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
-
-    def forward(self, x, collect_info=False):
-        if collect_info:
-            attn_out, attn_info = self.attn(self.ln_1(x), collect_info=collect_info)
-            x = x + attn_out
-            x = x + self.mlp(self.ln_2(x))
-            return x, attn_info
+        if self.config.use_nGPT == 1:
+            uv = self.c_fc(x)
+            suv = (self.suv * ((self.suv_init_value / self.suv_init_scaling) * (self.config.n_embd ** 0.5)))
+            uv = suv * uv
+            u, v = torch.chunk(uv, 2, dim=-1)
+            x = u * self.silu(v)
+            x = self.c_proj(x)
         else:
-            x = x + self.attn(self.ln_1(x))
-            x = x + self.mlp(self.ln_2(x))
-            return x
+            x = self.c_fc(x)
+            x = self.gelu(x)
+            x = self.c_proj(x)
+            x = self.dropout(x)
+        return x
 
 @dataclass
 class GPTConfig:
@@ -271,6 +282,95 @@ class GPTConfig:
     xpos2_adaptive: bool = True  # Should we change decay angle if there's risk of overflow
     precision: str = 'bfloat16'  # Precision
     scaling_target_sequence_length: int = None  # Target sequence length for scaling during training
+    use_nGPT: int = 0  # Whether to use nGPT modifications
+    base_scale: float = None  # Base scale for nGPT
+
+    def __post_init__(self):
+        if self.base_scale is None:
+            self.base_scale = 1.0 / (self.n_embd ** 0.5)
+
+class Block(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.attn = CausalSelfAttention(config)
+        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        self.mlp = MLP(config)
+
+        if config.use_nGPT == 1:
+            self.attn_alpha_init_value = 0.05
+            self.attn_alpha_init_scaling = config.base_scale
+            self.attn_alpha = nn.Parameter(self.attn_alpha_init_scaling * torch.ones(config.n_embd, dtype=torch.float16))
+
+            self.mlp_alpha_init_value = 0.05
+            self.mlp_alpha_init_scaling = config.base_scale
+            self.mlp_alpha = nn.Parameter(self.mlp_alpha_init_scaling * torch.ones(config.n_embd, dtype=torch.float16))
+
+    def justnorm(self, x):
+        res = x / x.norm(p=2, dim=-1, keepdim=True)
+        return res
+
+    def forward(self, x, collect_info=False):
+        if collect_info:
+            ln1_out = self.ln_1(x)
+            attn_out, attn_info = self.attn(ln1_out, collect_info=collect_info)
+            if self.config.use_nGPT == 1:
+                lr = self.attn_alpha * (self.attn_alpha_init_value / self.attn_alpha_init_scaling)
+                lr = torch.abs(lr)
+
+                A_norm = self.justnorm(ln1_out)
+                B_norm = self.justnorm(attn_out)
+
+                res = A_norm + lr * (B_norm - A_norm)
+                x = self.justnorm(res)
+            else:
+                x = x + attn_out
+
+            ln2_out = self.ln_2(x)
+            mlp_out = self.mlp(ln2_out)
+            if self.config.use_nGPT == 1:
+                lr = self.mlp_alpha * (self.mlp_alpha_init_value / self.mlp_alpha_init_scaling)
+                lr = torch.abs(lr)
+
+                A_norm = self.justnorm(ln2_out)
+                B_norm = self.justnorm(mlp_out)
+
+                res = A_norm + lr * (B_norm - A_norm)
+                x = self.justnorm(res)
+            else:
+                x = x + mlp_out
+            return x, attn_info
+        else:
+            ln1_out = self.ln_1(x)
+            attn_out = self.attn(ln1_out)
+            if self.config.use_nGPT == 1:
+                lr = self.attn_alpha * (self.attn_alpha_init_value / self.attn_alpha_init_scaling)
+                lr = torch.abs(lr)
+
+                A_norm = self.justnorm(ln1_out)
+                B_norm = self.justnorm(attn_out)
+
+                res = A_norm + lr * (B_norm - A_norm)
+                x = self.justnorm(res)
+            else:
+                x = x + attn_out
+
+            ln2_out = self.ln_2(x)
+            mlp_out = self.mlp(ln2_out)
+            if self.config.use_nGPT == 1:
+                lr = self.mlp_alpha * (self.mlp_alpha_init_value / self.mlp_alpha_init_scaling)
+                lr = torch.abs(lr)
+
+                A_norm = self.justnorm(ln2_out)
+                B_norm = self.justnorm(mlp_out)
+
+                res = A_norm + lr * (B_norm - A_norm)
+                x = self.justnorm(res)
+            else:
+                x = x + mlp_out
+            return x
 
 class GPT(nn.Module):
 
@@ -311,6 +411,11 @@ class GPT(nn.Module):
             if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer))
 
+        if config.use_nGPT == 1:
+            self.sz_init_value = 1.00
+            self.sz_init_scaling = config.base_scale
+            self.sz = nn.Parameter(self.sz_init_scaling * torch.ones(config.vocab_size, dtype=torch.float16))
+
         # Report number of parameters
         logging.info("Number of parameters: %.2fM" % (self.get_num_params() / 1e6,))
 
@@ -328,11 +433,17 @@ class GPT(nn.Module):
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if self.config.use_nGPT == 1:
+                torch.nn.init.normal_(module.weight, mean=0.0, std=self.config.base_scale)
+            else:
+                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None and hasattr(module.bias, 'data'):
                 module.bias.data.zero_()
         elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if self.config.use_nGPT == 1:
+                torch.nn.init.normal_(module.weight, mean=0.0, std=self.config.base_scale)
+            else:
+                torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None, collect_info=False, collect_probs_per_layer=False):
         device = idx.device
@@ -369,21 +480,19 @@ class GPT(nn.Module):
 
         x = self.transformer.ln_f(x)  # Shape: (b, t, n_embd)
 
-        """if collect_probs_per_layer:
-            # Compute final logits
-            if targets is not None:
-                final_logits = self.lm_head(x)  # Shape: (b, t, vocab_size)
-            else:
-                final_logits = self.lm_head(x[:, [-1], :])  # Shape: (b, 1, vocab_size)
-            logits_per_layer.append(final_logits)"""
-
         if targets is not None:
             # If we are given some desired targets also calculate the loss
             logits = self.lm_head(x)  # Shape: (b, t, vocab_size)
+            if self.config.use_nGPT == 1:
+                sz = self.sz * (self.sz_init_value / self.sz_init_scaling)
+                logits = sz * logits
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # Inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :])  # Shape: (b, 1, vocab_size)
+            if self.config.use_nGPT == 1:
+                sz = self.sz * (self.sz_init_value / self.sz_init_scaling)
+                logits = sz * logits
             loss = None
 
         if collect_info and collect_probs_per_layer:
