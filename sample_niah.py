@@ -63,7 +63,7 @@ device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.aut
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
-collect_info = True
+collect_info = False
 
 # model
 if init_from == 'resume':
@@ -79,6 +79,10 @@ if init_from == 'resume':
     #checkpoint['model_args']['scaling_target_sequence_length'] = MAX_SEQ_LEN
     #checkpoint['model_args']['use_nGPT'] = True
     checkpoint['model_args']['self_extend'] = True
+
+    #checkpoint['model_args']['softmax_log_k'] = 0.1
+    #checkpoint['model_args']['relu_instead_of_attn_softmax'] = True
+    #checkpoint['model_args']['topk_after_attn_softmax'] = 10
 
     logging.info(f"{pe} {flash}")
 
