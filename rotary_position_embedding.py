@@ -14,34 +14,18 @@ def _rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 class RotaryEmbedding(nn.Module):
-
-    def __init__(
-        self,
-        dim: int,
-        rotary_base: int = 10000,
-    ):
-        """
-        Args:
-
-            dim (int): rotary embedding dimension
-            rotary_base (int): rotary_base for the positional frequency (default: 10000)
-        """
+    def __init__(self, dim, rotary_base=10000):
         super().__init__()
-        self.rotary_base = rotary_base
-        inv_freq = 1.0 / (self.rotary_base ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer('inv_freq', inv_freq)
+        self.dim = dim
+        inv_freq = 1.0 / (rotary_base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq)
 
-    def forward(self, max_seq_len):
-        seq = torch.arange(max_seq_len, device=self.inv_freq.device)
-        seq = seq.type_as(self.inv_freq)
-
-        angles = einsum('i , j -> i j', seq, self.inv_freq)
-        # first part even vector components, second part odd vector components,
-        #  2 * dim in dimension size
-        emb = torch.cat((angles, angles), dim=-1)
-        # emb [seq_length, .., dim]
-        # return rearrange(emb, 'n d -> n 1 1 d')
+    def forward(self, positions):
+        # positions: tensor of shape (T,)
+        freqs = torch.einsum("i , j -> i j", positions.to(self.inv_freq.dtype), self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)  # Shape: (T, dim)
         return emb
+
 
 def apply_rotary_pos_emb(t, angles):
         """
