@@ -43,26 +43,32 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
-        # Key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-        # Output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        # Regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
         self.config = config
+        self.head_dropout = config.head_dropout
+        self.local_heads_during_training = config.local_heads_during_training
+        self.local_window_size = config.local_window_size
+        self.local_heads_random = config.local_heads_random
+        self.top_p = config.top_p
+        self.min_p = config.min_p
+        self.top_a = config.top_a
+        self.silu_before_attn_softmax = config.silu_before_attn_softmax
+        self.score_threshold = config.score_threshold
+        self.score_scale = config.score_scale
 
         self.alibi_slopes = None
         head_size = self.n_embd // self.n_head
 
         if config.pe == 'rope':
-            logging.debug(f'Initializing RoPE with base {config.rope_base}')
             self.rotary_pos_emb = RotaryEmbedding(head_size, rotary_base=config.rope_base)
         elif config.pe == 'xpos2':
-            max_xpos2_pos = config.block_size * 10  # Some buffer
+            max_xpos2_pos = config.block_size * 10
             self.rotary_pos_emb = Xpos2Embedding(
                 head_size, rotary_base=config.rope_base,
                 max_pos=max_xpos2_pos, decay_base=config.xpos2_decay_base,
@@ -72,63 +78,63 @@ class CausalSelfAttention(nn.Module):
         elif config.pe == 'alibi':
             self.alibi_slopes = build_slopes(
                 num_attention_heads=config.n_head,
-                num_attention_heads_alibi=config.n_head,  # It is a useful option to have not to rotate all alibi dims
-            ).squeeze().float()  # Shape: (nheads,)
+                num_attention_heads_alibi=config.n_head,
+            ).squeeze().float()
 
         if config.flash:
-            # Flash attention makes GPU go brrrr but support is only in PyTorch >= 2.0
             self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         else:
-            logging.info('Flash is turned off. GPUs will not go brrrr')
             self.flash = False
 
         if not self.flash:
-            logging.warning("Using slow attention. Flash Attention requires PyTorch >= 2.0")
-            # causal mask to ensure that attention is only applied to the left in the input sequence
-            ##  self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-            ##                              .view(1, 1, config.block_size, config.block_size))
-            # D.R. making it just a parameter so that FA checkpoints are compatible with non-FA checkpoints
             self.bias = torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size)
 
         if config.use_nGPT == 1:
             self.sqk_init_value = 1.0
             self.sqk_init_scaling = config.base_scale
-            self.sqk = nn.Parameter(self.sqk_init_scaling * torch.ones(config.n_embd, dtype=torch.float16))
+            self.sqk = nn.Parameter(self.sqk_init_scaling * torch.ones(config.n_embd, dtype=torch.float32))
 
     def justnorm(self, x):
         res = x / x.norm(p=2, dim=-1, keepdim=True)
         return res
 
     def forward(self, x, pos=None, collect_info=False):
-        B, T, C = x.size()  # Batch size, sequence length, embedding dimensionality (n_embd)
+        B, T, C = x.size()
         device = x.device
 
-        # Calculate query, key, values for all heads and move head forward to be the batch dim
         qkv = self.c_attn(x)
         q, k, v = qkv.split(self.n_embd, dim=2)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
-        # Scaling the query vectors based on position indices
+        if self.training and self.head_dropout > 0:
+            head_mask = torch.ones(self.n_head, device=q.device, dtype=q.dtype)
+            drop_indices = torch.randperm(self.n_head)[:self.head_dropout]
+            head_mask[drop_indices] = 0
+            head_mask = head_mask.bool().view(1, self.n_head, 1, 1)
+            q = q.masked_fill(~head_mask, 0.0).clone().detach() * (~head_mask) + q * head_mask
+            k = k.masked_fill(~head_mask, 0.0).clone().detach() * (~head_mask) + k * head_mask
+            v = v.masked_fill(~head_mask, 0.0).clone().detach() * (~head_mask) + v * head_mask
+
         if self.training and self.config.scaling_target_sequence_length is not None:
-            a = float(self.config.block_size)  # Training sequence length
-            b = float(self.config.scaling_target_sequence_length)  # Target sequence length
-            T = q.size(2)  # Current sequence length
+            a = float(self.config.block_size)
+            b = float(self.config.scaling_target_sequence_length)
+            T = q.size(2)
             if T > 1:
-                i = torch.arange(T, device=q.device, dtype=q.dtype).unsqueeze(0)  # Shape: (1, T)
-                scaling_factor = 1 + ((a / b) - 1) * (i / (T - 1))  # Shape: (1, T)
-                scaling_factor = scaling_factor.view(1, 1, T, 1)  # Reshape for broadcasting to (1, 1, T, 1)
+                i = torch.arange(T, device=q.device, dtype=q.dtype).unsqueeze(0)
+                scaling_factor = 1 + ((a / b) - 1) * (i / (T - 1))
+                scaling_factor = scaling_factor.view(1, 1, T, 1)
             else:
                 scaling_factor = torch.tensor(1.0, device=q.device, dtype=q.dtype).view(1, 1, 1, 1)
             q = q * scaling_factor
-        elif self.config.softmax_log_k > 0:  # D.R. log-based scaling formula
+        elif self.config.softmax_log_k > 0:
             if T > 1:
                 _k = float(self.config.softmax_log_k)
-                i = torch.arange(T, device=q.device, dtype=q.dtype).unsqueeze(0)  # Shape: (1, T)
-                i[0] = 1  # avoid -inf
+                i = torch.arange(T, device=q.device, dtype=q.dtype).unsqueeze(0)
+                i[0] = 1
                 scaling_factor = (1 - _k + _k * torch.log(i)).to(q.dtype)
-                scaling_factor = scaling_factor.view(1, 1, T, 1)  # Reshape for broadcasting to (1, 1, T, 1)
+                scaling_factor = scaling_factor.view(1, 1, T, 1)
             else:
                 scaling_factor = torch.tensor(1.0, device=q.device, dtype=q.dtype).view(1, 1, 1, 1)
             q = q * scaling_factor
@@ -138,23 +144,28 @@ class CausalSelfAttention(nn.Module):
             q = sqk * self.justnorm(q)
             k = sqk * self.justnorm(k)
 
-        # Prepare positions
         if pos is None:
-            pos = torch.arange(0, T, dtype=torch.long, device=device)  # Shape: (T)
+            pos = torch.arange(0, T, dtype=torch.long, device=device)
 
         if self.flash:
-            # No SelfExtend for now
+            q = q.to(torch.bfloat16)
+            k = k.to(torch.bfloat16)
+            v = v.to(torch.bfloat16)
+
             y = flash_attn_func(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
                                 dropout_p=self.dropout if self.training else 0, softmax_scale=None, causal=True,
                                 window_size=(-1, -1), alibi_slopes=self.alibi_slopes, deterministic=False)
             weighted_v = y.transpose(1, 2)
         else:
-            # Apply SelfExtend if activated and sequence length exceeds pretraining length
             if self.config.self_extend and T > self.config.pretraining_seq_length:
                 # Compute group size dynamically
                 denominator = max((self.config.pretraining_seq_length - self.config.window_size), 1)
-                g_size = (T - self.config.window_size + denominator - 1) // denominator
+                g_size = (T - self.config.window_size + denominator - 1) // denominator * 4
                 g_size = max(g_size, 1)
+
+
+                logging.info(f"g_size: {g_size}")
+
                 w_size = self.config.window_size
 
                 # Compute grouped positions
@@ -175,7 +186,8 @@ class CausalSelfAttention(nn.Module):
 
                 # Compute normal attention
                 ngb_attn = torch.matmul(ngb_q, ngb_k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-                ngb_attn = ngb_attn.masked_fill(torch.tril(torch.ones(T, T, device=device)).unsqueeze(0).unsqueeze(0) == 0, float('-inf'))
+                ngb_attn = ngb_attn.masked_fill(
+                    torch.tril(torch.ones(T, T, device=device)).unsqueeze(0).unsqueeze(0) == 0, float('-inf'))
 
                 # Apply positional encodings for grouped attention
                 if self.config.pe == 'rope':
@@ -189,7 +201,8 @@ class CausalSelfAttention(nn.Module):
 
                 # Compute grouped attention
                 g_attn = torch.matmul(g_q, g_k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-                g_attn = g_attn.masked_fill(torch.tril(torch.ones(T, T, device=device)).unsqueeze(0).unsqueeze(0) == 0, float('-inf'))
+                g_attn = g_attn.masked_fill(torch.tril(torch.ones(T, T, device=device)).unsqueeze(0).unsqueeze(0) == 0,
+                                            float('-inf'))
 
                 # Create masks
                 g_mask = torch.tril(torch.ones(T - w_size, T - w_size, device=device))
@@ -200,72 +213,105 @@ class CausalSelfAttention(nn.Module):
                 mask = mask.bool()
                 attn = torch.where(mask.unsqueeze(0).unsqueeze(0), ngb_attn, g_attn)
             else:
-                # Apply positional encodings
                 if self.config.pe == 'rope':
                     angles = self.rotary_pos_emb(pos)
                     q = apply_rotary_pos_emb(q, angles)
                     k = apply_rotary_pos_emb(k, angles)
                 elif self.config.pe == 'xpos2':
-                    # for now
                     pass
 
-                # Compute attention scores
                 attn = torch.matmul(q, k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
                 attn = attn.masked_fill(torch.tril(torch.ones(T, T, device=device)).unsqueeze(0).unsqueeze(0) == 0, float('-inf'))
 
-            # Compute attention scores
-            if self.config.relu_instead_of_attn_softmax:
-                attn_probs = F.relu(attn)
-            else:
-                attn_probs = F.softmax(attn, dim=-1)
+            if self.training and self.local_heads_during_training > 0:
+                if self.local_heads_random:
+                    head_indices = torch.randperm(self.n_head)[:self.local_heads_during_training]
+                else:
+                    head_indices = torch.arange(self.local_heads_during_training, device=device)
+                local_heads_mask = torch.zeros(self.n_head, device=device, dtype=torch.bool)
+                local_heads_mask[head_indices] = True
+
+                i = torch.arange(T, device=device).view(-1, 1)
+                j = torch.arange(T, device=device).view(1, -1)
+                local_mask = (i - j >= self.local_window_size).bool()
+                local_mask = local_mask.unsqueeze(0).unsqueeze(0)
+                local_heads_mask_expanded = local_heads_mask.view(1, self.n_head, 1, 1)
+                attn = attn.masked_fill(local_heads_mask_expanded & local_mask, float('-inf'))
+
+            if self.config.score_scale is not None and self.config.score_scale != 1.0:
+                attn = torch.where(attn < self.config.score_threshold, attn * self.config.score_scale, attn)
+
+            if self.config.relu_before_attn_softmax:
+                attn = F.relu(attn)
+                attn = attn.masked_fill(torch.tril(torch.ones(T, T, device=device)).unsqueeze(0).unsqueeze(0) == 0, float('-inf'))
+                if self.config.relu_neg_inf:
+                    attn = attn.masked_fill(attn <= 0, float('-inf'))
+
+            if self.config.silu_before_attn_softmax:
+                attn = F.silu(attn)
+                attn = attn.masked_fill(torch.tril(torch.ones(T, T, device=device)).unsqueeze(0).unsqueeze(0) == 0, float('-inf'))
+
+            attn_probs = F.softmax(attn, dim=-1)
+
+            if self.config.top_p > 0:
+                sorted_probs, sorted_indices = torch.sort(attn_probs, descending=True, dim=-1)
+                cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+                cumulative_mask = cumulative_probs <= self.config.top_p
+                cumulative_mask[..., 0] = True
+                sorted_probs = sorted_probs * cumulative_mask
+                sorted_probs_sum = sorted_probs.sum(dim=-1, keepdim=True) + 1e-8
+                sorted_probs = sorted_probs / sorted_probs_sum
+                attn_probs = torch.zeros_like(attn_probs).scatter_(-1, sorted_indices, sorted_probs)
+
+            if self.config.min_p > 0:
+                max_probs, _ = torch.max(attn_probs, dim=-1, keepdim=True)
+                min_threshold = max_probs * self.config.min_p
+                min_p_mask = attn_probs >= min_threshold
+                attn_probs = attn_probs * min_p_mask
+                attn_probs_sum = attn_probs.sum(dim=-1, keepdim=True) + 1e-8
+                attn_probs = attn_probs / attn_probs_sum
+
+            if self.config.top_a > 0:
+                max_probs, _ = torch.max(attn_probs, dim=-1, keepdim=True)
+                threshold = (max_probs ** 2) * self.config.top_a
+                top_a_mask = attn_probs >= threshold
+                attn_probs = attn_probs * top_a_mask
+                attn_probs_sum = attn_probs.sum(dim=-1, keepdim=True) + 1e-8
+                attn_probs = attn_probs / attn_probs_sum
 
             if self.config.topk_after_attn_softmax > 0:
-                # Find the top values in each row along the last dimension
                 top_n_values, top_n_indices = torch.topk(attn_probs, self.config.topk_after_attn_softmax, dim=-1)
-
-                # Create a mask to zero out all but the top 'n' values
                 mask = torch.zeros_like(attn_probs)
-                mask.scatter_(-1, top_n_indices, 1.0)  # Fill in ones at the top 'n' indices
-
-                # Apply the mask to the attention probabilities
+                mask.scatter_(-1, top_n_indices, 1.0)
                 attn_probs = attn_probs * mask
-
-                # Optionally, you might want to re-normalize the attention probabilities after masking
-                attn_probs = attn_probs / attn_probs.sum(dim=-1, keepdim=True)
+                attn_probs_sum = attn_probs.sum(dim=-1, keepdim=True) + 1e-8
+                attn_probs = attn_probs / attn_probs_sum
 
             attn_probs = self.attn_dropout(attn_probs)
 
-            # Collect norms
-            q_norms = q.norm(dim=-1)  # Shape: (B, nh, T)
+            q_norms = q.norm(dim=-1)
             k_norms = k.norm(dim=-1)
             v_norms = v.norm(dim=-1)
-            embedding_norms = x.norm(dim=-1).unsqueeze(1).expand(-1, self.n_head, -1)  # Shape: (B, nh, T)
+            embedding_norms = x.norm(dim=-1).unsqueeze(1).expand(-1, self.n_head, -1)
 
             if collect_info:
-                # Compute weighted_v and collect info
                 weighted_v = torch.matmul(attn_probs, v)
-                weighted_v_norms = weighted_v.norm(dim=-1)  # Shape: (B, nh, T)
+                weighted_v_norms = weighted_v.norm(dim=-1)
 
-                # Compute weighted_v excluding top-k attended tokens
                 effective_top_k = min(5, T)
                 topk_values, topk_indices = torch.topk(attn_probs, k=effective_top_k, dim=-1)
                 att_probs_excl_topk = attn_probs.clone()
-
-                # Zero out topk attention probabilities
                 att_probs_excl_topk.scatter_(
                     dim=-1,
                     index=topk_indices,
                     value=0.0
                 )
-
-                # Do NOT renormalize the attention probabilities
                 weighted_v_excl_topk = torch.matmul(att_probs_excl_topk, v)
                 weighted_v_excl_topk_norms = weighted_v_excl_topk.norm(dim=-1)
 
-                # Get top-k attention indices and values
-                topk_values_to, topk_indices_to  = torch.topk(attn_probs, k=effective_top_k, dim=-1)
+                topk_values_to, topk_indices_to = torch.topk(attn_probs, k=effective_top_k, dim=-1)
                 att_probs_T = attn_probs.transpose(-2, -1)
-                topk_values_from, topk_indices_from  = torch.topk(att_probs_T, k=effective_top_k, dim=-1)
+                topk_values_from, topk_indices_from = torch.topk(att_probs_T, k=effective_top_k, dim=-1)
 
                 extra_info = {
                     'q_norms': q_norms,
@@ -285,14 +331,14 @@ class CausalSelfAttention(nn.Module):
 
         y = weighted_v.transpose(1, 2).contiguous().view(B, T, C)
 
-        # Output projection
         y = self.resid_dropout(self.c_proj(y))
-
 
         if collect_info:
             return y, extra_info
         else:
             return y
+
+
 
 class MLP(nn.Module):
 
@@ -305,7 +351,7 @@ class MLP(nn.Module):
             self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
             self.suv_init_value = 1.0
             self.suv_init_scaling = 1.0
-            self.suv = nn.Parameter(self.suv_init_scaling * torch.ones(2 * 4 * config.n_embd, dtype=torch.float16))
+            self.suv = nn.Parameter(self.suv_init_scaling * torch.ones(2 * 4 * config.n_embd, dtype=torch.float32))
         else:
             self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
             self.gelu    = nn.GELU()
@@ -342,7 +388,7 @@ class GPTConfig:
     xpos2_decay_base: float = 2.0  # Decay base
     xpos2_decay_angle: float = math.pi / 2  # Soft max angle
     xpos2_adaptive: bool = True  # Should we change decay angle if there's risk of overflow
-    precision: str = 'bfloat16'  # Precision
+    precision: str = 'float16'  # Precision
 
     scaling_target_sequence_length: int = None  # Target sequence length for scaling during training
 
@@ -351,13 +397,28 @@ class GPTConfig:
     use_nGPT: int = 0  # Whether to use nGPT modifications
     base_scale: float = None  # Base scale for nGPT
 
-    relu_instead_of_attn_softmax: bool = False  # Use ReLU instead of softmax for attention scores
+    relu_before_attn_softmax: bool = False  # Use ReLU instead of softmax for attention scores
     topk_after_attn_softmax: int = 0  # Keep only top-k attention scores
+
+    relu_neg_inf: bool = False # after RELU also set 0 values to -inf
 
     # New parameters for SelfExtend
     pretraining_seq_length: int = None  # Defaults to 1k if not set
     window_size: int = 128              # Normal attention window
     self_extend: bool = False           # SelfExtend flag
+
+    head_dropout: int = 0
+
+    local_heads_during_training: int = 0
+    local_window_size: int = 128
+    local_heads_random: bool = False
+
+    top_p: float = 0.0
+    min_p: float = 0.0
+    top_a: float = 0.0
+    silu_before_attn_softmax: bool = False
+    score_threshold: float = 0.0
+    score_scale: float = 1.0
 
     def __post_init__(self):
         if self.base_scale is None:
@@ -378,11 +439,11 @@ class Block(nn.Module):
         if config.use_nGPT == 1:
             self.attn_alpha_init_value = 0.05
             self.attn_alpha_init_scaling = config.base_scale
-            self.attn_alpha = nn.Parameter(self.attn_alpha_init_scaling * torch.ones(config.n_embd, dtype=torch.float16))
+            self.attn_alpha = nn.Parameter(self.attn_alpha_init_scaling * torch.ones(config.n_embd, dtype=torch.float32))
 
             self.mlp_alpha_init_value = 0.05
             self.mlp_alpha_init_scaling = config.base_scale
-            self.mlp_alpha = nn.Parameter(self.mlp_alpha_init_scaling * torch.ones(config.n_embd, dtype=torch.float16))
+            self.mlp_alpha = nn.Parameter(self.mlp_alpha_init_scaling * torch.ones(config.n_embd, dtype=torch.float32))
 
     def justnorm(self, x):
         res = x / x.norm(p=2, dim=-1, keepdim=True)
@@ -490,7 +551,7 @@ class GPT(nn.Module):
         if config.use_nGPT == 1:
             self.sz_init_value = 1.00
             self.sz_init_scaling = config.base_scale
-            self.sz = nn.Parameter(self.sz_init_scaling * torch.ones(config.vocab_size, dtype=torch.float16))
+            self.sz = nn.Parameter(self.sz_init_scaling * torch.ones(config.vocab_size, dtype=torch.float32))
 
         # Report number of parameters
         logging.info("Number of parameters: %.2fM" % (self.get_num_params() / 1e6,))
@@ -908,11 +969,6 @@ class GPT(nn.Module):
                         })
                     next_token_probs_per_layer.append(next_token_probs_layer)
 
-            # Apply temperature and top_k to final logits
-            if top_k is not None:
-                current_top_k = min(top_k, logits.size(-1))
-                v, _ = torch.topk(logits, k=current_top_k)
-                logits[logits < v[:, [-1]]] = -float('inf')
 
             probs = F.softmax(logits, dim=-1)  # Shape: (1, vocab_size)
 
@@ -929,14 +985,31 @@ class GPT(nn.Module):
                     'probability': probability
                 })
 
+            for token_id in [807, 42534, 31675]:
+                probability = probs[0, token_id].item()
+                decoded_token = decode([token_id]) if decode else None
+                next_token_probs.append({
+                    'token_id': token_id,
+                    'decoded_token': decoded_token,
+                    'probability': probability
+                })
+
+            if top_k is not None:
+                current_top_k = min(top_k, logits.size(-1))
+                v, _ = torch.topk(logits, k=current_top_k)
+                logits[logits < v[:, [-1]]] = -float('inf')
+
+            probs = F.softmax(logits, dim=-1)  # Shape: (1, vocab_size)
+
             # Sample the next token
             idx_next = torch.multinomial(probs, num_samples=1)  # Shape: (1, 1)
             idx = torch.cat((idx, idx_next), dim=1)  # Append to sequence
 
+            token_id = idx[:, -2].item()
+            # -2 because we are updating information for the token before the last generated one
+            decoded_token = decode([token_id]) if decode else None
+
             if collect_info:
-                token_id = idx[:, -2].item()
-                # -2 because we are updating information for the token before the last generated one
-                decoded_token = decode([token_id]) if decode else None
                 token_info = {
                     'token_id': token_id,
                     'decoded_token': decoded_token,
@@ -1009,6 +1082,12 @@ class GPT(nn.Module):
                     token_norms.append(token_norm)
                     generated_info.append(token_info)
 
+            print(decoded_token)
+            print(next_token_probs)
+
+            if decoded_token not in [':', '8', '090', '293', ' 8', ' 090', ' 293']:
+                break
+
         if collect_info:
             # Include initial context length in the generated_info
             generated_info[0]['initial_context_length'] = initial_context_length
@@ -1040,4 +1119,3 @@ class GPT(nn.Module):
                 return idx, logits_per_layer_generated
             else:
                 return idx
-

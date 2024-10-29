@@ -4,7 +4,6 @@ Sample from a trained model
 import os
 import pickle
 from contextlib import nullcontext
-from fileinput import close
 from tabnanny import check
 
 import torch
@@ -12,12 +11,14 @@ import tiktoken
 from model import GPTConfig, GPT
 import logging
 
+
 instr = "A special magic number is hidden within the following text. Make sure to memorize it. I will quiz you about the number afterwards."
 distractor_unit = "The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again."
 # print(f'distractor len: {len(distractor)}')
 needle = "One of the special magic numbers for jobless-speech is: 8090293."
 query = "What is the special magic number for jobless-speech mentioned in the provided text? The special magic number for jobless-speech mentioned in the provided text is"
-n_distractors = 70
+#n_distractors = 160#4k
+n_distractors = 600
 distractor = ' '.join([distractor_unit] * n_distractors)
 print(f'distractor len: {len(distractor)}')
 needle_pos_within_distractor = 100
@@ -29,14 +30,16 @@ distractor_needle = distractor[:needle_pos_within_distractor] + " " + needle + "
 start = " ".join([instr, distractor_needle, query])
 start += ":"
 print(f'start len: {len(start)}, start: {start}')
-MAX_SEQ_LEN = 4096 # override what's in the checkpoint
+MAX_SEQ_LEN = 4096
+MAX_SEQ_LEN = 20000
+#MAX_SEQ_LEN = 40000#4096 # override what's in the checkpoint
 
 # -----------------------------------------------------------------------------
 init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
 out_dir = 'out' # ignored if init_from is not 'resume'
 #start = "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
 num_samples = 1 # number of samples to draw
-max_new_tokens = 10 # number of tokens generated in each sample
+max_new_tokens = 3 # number of tokens generated in each sample
 temperature = 0.8 # 1.0 = no change, < 1.0 = less random, > 1.0 = more random, in predictions
 #top_k = 200 # retain only the top_k most likely tokens, clamp others to have 0 probability
 top_k = 1 # greedy
@@ -68,11 +71,42 @@ collect_info = False
 # model
 if init_from == 'resume':
     # init from a model saved in a specific directory
-    ckpt_path = "gpt2-rope.pt"
-    info_path = "gpt2-rope.info3"
+    #ckpt_path = "gpt2-rope.pt"
+    #info_path = "gpt2-rope.info"
+
+    #ckpt_path = "ngpt_120M_rope_nonfa_logscale_k0_5_val306.pt"
+    #info_path = "ngpt_120M_rope_nonfa_val303.info"
+
+    #ckpt_path = "ngpt_120M_rope_nonfa_logscale_k0_5_val303.pt"
+    #info_path = "ngpt_120M_rope_nonfa_logscale_k0_5_val303.info"
+
+    #ckpt_path = "ngpt_120M_rope_nonfa_scale4k_val293.pt"
+    #info_path = "ngpt_120M_rope_nonfa_scale4k_val293.info"
+
+    #ckpt_path = "ngpt_120M_rope_nonfa_val299.pt"
+    #info_path = "ngpt_120M_rope_nonfa_val299.info"
+
+    ckpt_path = "ngpt_120M_rope_nonfa_relu_topk10_val308.pt"
+    #info_path = "ngpt_120M_rope_nonfa_relu_topk10_val308_4k.info"
+    #info_path = "ngpt_120M_rope_nonfa_relu_topk10_val308_n_distr_" + str(n_distractors) + ".info"
+
+    #ckpt_path = "ngpt_120M_rope_nonfa_topk10_val308.pt"
+
+    #ckpt_path = "ngpt_120M_rope_nonfa_relu_val298.pt"
+
+    #ckpt_path = "ngpt_120M_rope_nonfa_min_p_01_val306.pt"
+
+    #ckpt_path = "ngpt_120M_rope_nonfa_locheads9_rand_val302.pt"
+    #ckpt_path = "ngpt_120M_rope_nonfa_locheads9_rand_relu_val308.pt"
+    #ckpt_path = "ngpt_120M_rope_nonfa_locheads9_rand_topk10_val319.pt"
+
+    #ckpt_path = "ngpt_120M_rope_nonfa_silu_val303.pt"
+
+
     checkpoint = torch.load(ckpt_path, map_location=device)
-    # Dima
+
     #checkpoint['model_args']['pe'] = pe
+    checkpoint['model_args']['precision'] = 'float16'
     checkpoint['model_args']['flash'] = flash
     checkpoint['model_args']['block_size'] = MAX_SEQ_LEN
 
@@ -80,9 +114,15 @@ if init_from == 'resume':
     #checkpoint['model_args']['use_nGPT'] = True
     checkpoint['model_args']['self_extend'] = True
 
+    #checkpoint['model_args']['relu_before_attn_softmax'] = True
+
+    #checkpoint['model_args']['rope_base'] = 100000
+
     #checkpoint['model_args']['softmax_log_k'] = 0.1
     #checkpoint['model_args']['relu_instead_of_attn_softmax'] = True
-    #checkpoint['model_args']['topk_after_attn_softmax'] = 10
+    checkpoint['model_args']['topk_after_attn_softmax'] = 10
+
+    #checkpoint['model_args']['window_size'] = 512
 
     logging.info(f"{pe} {flash}")
 
@@ -191,7 +231,7 @@ with torch.no_grad():
 
                 logging.info('---------------')
             else:
-                y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
+                y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k, decode=decode)
                 out = decode(y[0].tolist())
                 logging.info(f'input: "{start}"')
                 logging.info(f'input end: "{out[len(start)-100:len(start)]}"')

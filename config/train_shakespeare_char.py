@@ -39,8 +39,12 @@ warmup_iters = 100 # not super necessary potentially
 pe = 'rope'
 rope_base = 10000
 
-precision = 'bfloat16'
-xpos2_decay_base = 2.0
-xpos2_decay_angle = 1.570796327 # math.pi / 2
-xpos2_adaptive = True
-flash = True
+#precision = 'bfloat16'
+#xpos2_decay_base = 2.0
+#xpos2_decay_angle = 1.570796327 # math.pi / 2
+#xpos2_adaptive = True
+flash = False
+device = 'mps'
+compile = False
+
+relu_instead_of_attn_softmax = False

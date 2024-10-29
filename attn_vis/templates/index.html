@@ -79,6 +79,13 @@
         .generated-token {
             color: rgba(255, 0, 255, 0.6);
         }
+        .gap-token {
+            display: inline-block;
+            margin: 2px;
+            padding: 5px 8px;
+            color: #999;
+            font-style: italic;
+        }
     </style>
 
 </head>
@@ -89,7 +96,14 @@
         <div class="col-md-8">
             <div id="token-list">
                 {% for token in tokens %}
-                <span class="token {% if token.is_generated %}generated-token{% endif %}" data-index="{{ token.index }}" id="token-{{ token.index }}">{{ token.decoded_token }}</span>
+                    {% if token.is_gap %}
+                        <span class="gap-token">{{ token.decoded_token }}</span>
+                    {% else %}
+                        <span class="token {% if token.is_generated %}generated-token{% endif %}"
+                              data-display-index="{{ token.display_index }}"
+                              data-actual-index="{{ token.actual_index }}"
+                              id="token-{{ token.display_index }}">{{ token.decoded_token }}</span>
+                    {% endif %}
                 {% endfor %}
             </div>
         </div>
@@ -138,6 +152,17 @@
     $(document).ready(function() {
         let currentHead = 0; // Initialize current head index
 
+        // Collect valid tokens and their mappings
+        let validTokens = [];
+        let displayIndexToActualIndex = {};
+
+        $('.token').each(function() {
+            let displayIndex = $(this).data('display-index');
+            let actualIndex = $(this).data('actual-index');
+            validTokens.push(displayIndex);
+            displayIndexToActualIndex[displayIndex] = actualIndex;
+        });
+
         // Function to update head selection
         function updateHeadSelection(newHead) {
             $('#head-select').val(newHead);
@@ -177,34 +202,37 @@
                 e.preventDefault(); // Prevent default action
             }
 
-            // Add these conditionals within the existing keydown event listener
             if (e.key === 'ArrowRight' || e.key.toLowerCase() === 'n') {
                 // Move to next token
-                if (selectedTokenIndex < $('.token').length - 1) {
-                    selectedTokenIndex += 1;
+                let currentIndex = validTokens.indexOf(selectedDisplayIndex);
+                if (currentIndex < validTokens.length -1) {
+                    selectedDisplayIndex = validTokens[currentIndex +1];
                 } else {
-                    selectedTokenIndex = 0; // Wrap around to first token
+                    selectedDisplayIndex = validTokens[0]; // Wrap around to first token
                 }
+                selectedActualIndex = displayIndexToActualIndex[selectedDisplayIndex];
                 $('.token').removeClass('selected-token');
-                $(`#token-${selectedTokenIndex}`).addClass('selected-token');
+                $(`#token-${selectedDisplayIndex}`).addClass('selected-token');
                 updateTokenInfo();
                 // Scroll the selected token into view smoothly and center it
-                $(`#token-${selectedTokenIndex}`)[0].scrollIntoView({ behavior: 'smooth', block: 'center' });
+                $(`#token-${selectedDisplayIndex}`)[0].scrollIntoView({ behavior: 'smooth', block: 'center' });
                 e.preventDefault(); // Prevent default action
             }
 
             if (e.key === 'ArrowLeft' || e.key.toLowerCase() === 'p') {
                 // Move to previous token
-                if (selectedTokenIndex > 0) {
-                    selectedTokenIndex -= 1;
+                let currentIndex = validTokens.indexOf(selectedDisplayIndex);
+                if (currentIndex > 0) {
+                    selectedDisplayIndex = validTokens[currentIndex -1];
                 } else {
-                    selectedTokenIndex = $('.token').length - 1; // Wrap around to last token
+                    selectedDisplayIndex = validTokens[validTokens.length -1]; // Wrap around to last token
                 }
+                selectedActualIndex = displayIndexToActualIndex[selectedDisplayIndex];
                 $('.token').removeClass('selected-token');
-                $(`#token-${selectedTokenIndex}`).addClass('selected-token');
+                $(`#token-${selectedDisplayIndex}`).addClass('selected-token');
                 updateTokenInfo();
                 // Scroll the selected token into view smoothly and center it
-                $(`#token-${selectedTokenIndex}`)[0].scrollIntoView({ behavior: 'smooth', block: 'center' });
+                $(`#token-${selectedDisplayIndex}`)[0].scrollIntoView({ behavior: 'smooth', block: 'center' });
                 e.preventDefault(); // Prevent default action
             }
         });
@@ -217,7 +245,8 @@
             updateTokenInfo();
         }
 
-        let selectedTokenIndex = null;
+        let selectedDisplayIndex = null;
+        let selectedActualIndex = null;
 
         // Handle token click
         $('.token').click(function() {
@@ -225,13 +254,14 @@
             $('.token').removeClass('selected-token attended-to attending-from both-attention');
             $('.token').css('background-color', '');
 
-            selectedTokenIndex = $(this).data('index');
+            selectedDisplayIndex = $(this).data('display-index');
+            selectedActualIndex = $(this).data('actual-index');
             $(this).addClass('selected-token');
             updateTokenInfo();
         });
 
         $('#layer-select, #head-select').change(function() {
-            if (selectedTokenIndex !== null) {
+            if (selectedDisplayIndex !== null) {
                 updateTokenInfo();
             }
         });
@@ -240,10 +270,14 @@
             const selectedLayer = $('#layer-select').val();
             const selectedHead = $('#head-select').val();
             $.post('/get_token_info', {
-                token_index: selectedTokenIndex,
+                token_actual_index: selectedActualIndex,
                 selected_layer: selectedLayer,
                 selected_head: selectedHead
             }, function(data) {
+                if (data.error) {
+                    alert(data.error);
+                    return;
+                }
                 // Update selected token text
                 $('#selected-token-text').text(data.selected_token_text);
 
@@ -264,8 +298,6 @@
                 $('#top-tokens-to-list').empty();
                 for (let i = 0; i < data.topk_tokens_to.length; i++) {
                     let tokenInfo = data.topk_tokens_to[i];
-                    let tokenIndex = tokenInfo.token_index;
-                    let tokenText = tokenInfo.decoded_token; // Use decoded_token directly
                     let attentionScore = data.topk_scores_to[i].toFixed(4);
                     let distance = data.topk_distances_to[i];
                     let kNorm = data.topk_k_norms_to[i].toFixed(4);
@@ -273,7 +305,7 @@
                     let contextHtml = buildContextHtml(tokenInfo.context_tokens);
 
                     $('#top-tokens-to-list').append(`<li>
-                        <strong>Token:</strong> ${tokenText} (Attention Score: ${attentionScore}, Relative position: ${distance}, K Norm: ${kNorm}, V Norm: ${vNorm})
+                        <strong>Token:</strong> ${tokenInfo.decoded_token} (Attention Score: ${attentionScore}, Relative position: ${distance}, K Norm: ${kNorm}, V Norm: ${vNorm})
                         <br>Context (this token in bold, selected token in red):<br>${contextHtml}
                     </li><hr>`);
                 }
@@ -285,15 +317,13 @@
                 } else {
                     for (let i = 0; i < data.topk_tokens_from.length; i++) {
                         let tokenInfo = data.topk_tokens_from[i];
-                        let tokenIndex = tokenInfo.token_index;
-                        let tokenText = tokenInfo.decoded_token; // Use decoded_token directly
                         let attentionScore = data.topk_scores_from[i].toFixed(4);
                         let distance = data.topk_distances_from[i];
                         let qNorm = data.topk_q_norms_from[i].toFixed(4);
                         let contextHtml = buildContextHtml(tokenInfo.context_tokens);
 
                         $('#top-tokens-from-list').append(`<li>
-                            <strong>Token:</strong> ${tokenText} (Attention Score: ${attentionScore}, Relative position: ${distance}, Q Norm: ${qNorm})
+                            <strong>Token:</strong> ${tokenInfo.decoded_token} (Attention Score: ${attentionScore}, Relative position: ${distance}, Q Norm: ${qNorm})
                             <br>Context (this token in bold, selected token in red):<br>${contextHtml}
                         </li><hr>`);
                     }
@@ -332,16 +362,16 @@
             let maxTotalAttention = Math.max(...total_attention_per_token);
 
             $('.token').each(function() {
-                let index = $(this).data('index');
-                let attnFromScore = attention_from_selected[index];
-                let attnToScore = attention_to_selected[index];
-                let totalAttention = total_attention_per_token[index];
+                let actualIndex = $(this).data('actual-index');
+                let attnFromScore = attention_from_selected[actualIndex];
+                let attnToScore = attention_to_selected[actualIndex];
+                let totalAttention = total_attention_per_token[actualIndex];
 
                 $(this).removeClass('attended-to attending-from both-attention');
                 $(this).css('--attention-opacity', Math.max(attnFromScore, attnToScore));
 
                 // Adjust text opacity based on total attention with a higher minimum value
-                let opacity = (totalAttention / maxTotalAttention) * 0.7 + 0.3; // Ensures opacity is between 0.3 and 1.0
+                let opacity = maxTotalAttention > 0 ? (totalAttention / maxTotalAttention) * 0.7 + 0.3 : 1.0;
                 opacity = Math.min(Math.max(opacity, 0.5), 1.0); // Clamp opacity between 0.5 and 1.0
                 $(this).css('opacity', opacity);
 
@@ -358,8 +388,9 @@
         // Initial setup
         $('#layer-select').val(0);
         $('#head-select').val(0);
-        selectedTokenIndex = 0;
-        $(`#token-${selectedTokenIndex}`).addClass('selected-token');
+        selectedDisplayIndex = validTokens[0];
+        selectedActualIndex = displayIndexToActualIndex[selectedDisplayIndex];
+        $(`#token-${selectedDisplayIndex}`).addClass('selected-token');
         updateTokenInfo();
 
         // Hover effects
