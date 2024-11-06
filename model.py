@@ -389,7 +389,7 @@ class CausalSelfAttention(nn.Module):
             mask = self._create_merge_mask(T, w_size, device)
             causal_mask = torch.tril(torch.ones(T, T, device=device)).unsqueeze(0).unsqueeze(0)
 
-            for t_start in tqdm(range(0, T, chunk_size)):
+            for t_start in (range(0, T, chunk_size)):
                 t_end = min(t_start + chunk_size, T)
                 q_chunk = q[:, :, t_start:t_end, :]
 
@@ -1315,14 +1315,14 @@ class GPT(nn.Module):
                     'probability': probability
                 })
 
-            for token_id in [807, 42534, 31675]:
+            """for token_id in [807, 42534, 31675]:
                 probability = probs[0, token_id].item()
                 decoded_token = decode([token_id]) if decode else None
                 next_token_probs.append({
                     'token_id': token_id,
                     'decoded_token': decoded_token,
                     'probability': probability
-                })
+                })"""
 
             if top_k is not None:
                 current_top_k = min(top_k, logits.size(-1))
@@ -1415,8 +1415,8 @@ class GPT(nn.Module):
             print(decoded_token)
             print(next_token_probs)
 
-            if decoded_token not in [':', '8', '090', '293', ' 8', ' 090', ' 293']:
-                break
+            #if decoded_token not in [':', '8', '090', '293', ' 8', ' 090', ' 293']:
+            #    break
 
         if collect_info:
             # Include initial context length in the generated_info
