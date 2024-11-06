@@ -108,6 +108,7 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
+
         if self.training and self.head_dropout > 0:
             head_mask = torch.ones(self.n_head, device=q.device, dtype=q.dtype)
             drop_indices = torch.randperm(self.n_head)[:self.head_dropout]
@@ -147,6 +148,8 @@ class CausalSelfAttention(nn.Module):
         if pos is None:
             pos = torch.arange(0, T, dtype=torch.long, device=device)
 
+        #q = q * 1.6
+
         if self.flash:
             q = q.to(torch.bfloat16)
             k = k.to(torch.bfloat16)
@@ -156,11 +159,14 @@ class CausalSelfAttention(nn.Module):
                                 dropout_p=self.dropout if self.training else 0, softmax_scale=None, causal=True,
                                 window_size=(-1, -1), alibi_slopes=self.alibi_slopes, deterministic=False)
             weighted_v = y.transpose(1, 2)
+        elif self.config.use_pseudo_flash:
+            # Use pseudo-flash attention
+            weighted_v, extra_info = self.pseudo_flash_attention(q, k, v, pos, x, collect_info)
         else:
             if self.config.self_extend and T > self.config.pretraining_seq_length:
                 # Compute group size dynamically
                 denominator = max((self.config.pretraining_seq_length - self.config.window_size), 1)
-                g_size = (T - self.config.window_size + denominator - 1) // denominator * 4
+                g_size = (T - self.config.window_size + denominator - 1) // denominator * 2
                 g_size = max(g_size, 1)
 
 
@@ -253,6 +259,14 @@ class CausalSelfAttention(nn.Module):
 
             attn_probs = F.softmax(attn, dim=-1)
 
+            if self.config.topk_after_attn_softmax > 0:
+                top_n_values, top_n_indices = torch.topk(attn_probs, self.config.topk_after_attn_softmax, dim=-1)
+                mask = torch.zeros_like(attn_probs)
+                mask.scatter_(-1, top_n_indices, 1.0)
+                attn_probs = attn_probs * mask
+                attn_probs_sum = attn_probs.sum(dim=-1, keepdim=True) + 1e-8
+                attn_probs = attn_probs / attn_probs_sum
+
             if self.config.top_p > 0:
                 sorted_probs, sorted_indices = torch.sort(attn_probs, descending=True, dim=-1)
                 cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
@@ -279,13 +293,7 @@ class CausalSelfAttention(nn.Module):
                 attn_probs_sum = attn_probs.sum(dim=-1, keepdim=True) + 1e-8
                 attn_probs = attn_probs / attn_probs_sum
 
-            if self.config.topk_after_attn_softmax > 0:
-                top_n_values, top_n_indices = torch.topk(attn_probs, self.config.topk_after_attn_softmax, dim=-1)
-                mask = torch.zeros_like(attn_probs)
-                mask.scatter_(-1, top_n_indices, 1.0)
-                attn_probs = attn_probs * mask
-                attn_probs_sum = attn_probs.sum(dim=-1, keepdim=True) + 1e-8
-                attn_probs = attn_probs / attn_probs_sum
+
 
             attn_probs = self.attn_dropout(attn_probs)
 
@@ -338,7 +346,326 @@ class CausalSelfAttention(nn.Module):
         else:
             return y
 
+    def pseudo_flash_attention(self, q, k, v, pos, x, collect_info):
+        """
+        Pseudo-flash attention implementation to limit memory consumption without using flash attention.
+        Processes attention in chunks and handles self-extend logic.
+        """
+        B, n_head, T, head_dim = q.size()
+        device = q.device
+        weighted_v = torch.zeros_like(q)
+        chunk_size = self.config.pseudo_flash_chunk_size
 
+        # Initialize lists for information collection
+        if collect_info:
+            q_norms_list = []
+            k_norms_list = []
+            v_norms_list = []
+            embedding_norms_list = []
+            weighted_v_norms_list = []
+            topk_values_to_list = []
+            topk_indices_to_list = []
+            topk_values_from_list = []
+            topk_indices_from_list = []
+
+        # Check if self_extend is enabled
+        if self.config.self_extend and T > self.config.pretraining_seq_length:
+            # Assume self_extend is only used in inference
+            # Compute group size dynamically
+            denominator = max((self.config.pretraining_seq_length - self.config.window_size), 1)
+            g_size = (T - self.config.window_size + denominator - 1) // denominator * 32
+            g_size = max(g_size, 1)
+
+            w_size = self.config.window_size
+
+            # Compute grouped positions
+            g_pos = pos // g_size
+            # Compute shift
+            shift = w_size - (w_size // g_size)
+            # Compute shifted grouped positions
+            s_g_pos = g_pos + shift
+
+            # Precompute masks and causal masks
+            mask = self._create_merge_mask(T, w_size, device)
+            causal_mask = torch.tril(torch.ones(T, T, device=device)).unsqueeze(0).unsqueeze(0)
+
+            for t_start in tqdm(range(0, T, chunk_size)):
+                t_end = min(t_start + chunk_size, T)
+                q_chunk = q[:, :, t_start:t_end, :]
+
+                # Prepare k and v up to t_end for causal attention
+                k_chunk = k[:, :, :t_end, :]
+                v_chunk = v[:, :, :t_end, :]
+
+                # Compute normal attention scores (ngb_attn)
+                if self.config.pe == 'rope':
+                    angles_ngb_q = self.rotary_pos_emb(pos[t_start:t_end])
+                    q_chunk_ngb = apply_rotary_pos_emb(q_chunk, angles_ngb_q)
+                    angles_ngb_k = self.rotary_pos_emb(pos[:t_end])
+                    k_chunk_ngb = apply_rotary_pos_emb(k_chunk, angles_ngb_k)
+                elif self.config.pe == 'xpos2':
+                    # Implement xpos2 positional encodings if needed
+                    pass
+
+                attn_scores_chunk_ngb = torch.matmul(q_chunk_ngb, k_chunk_ngb.transpose(-2, -1)) * (
+                            1.0 / math.sqrt(head_dim))
+
+                # Compute grouped attention scores (g_attn)
+                if self.config.pe == 'rope':
+                    angles_grp_q = self.rotary_pos_emb(s_g_pos[t_start:t_end])
+                    q_chunk_grp = apply_rotary_pos_emb(q_chunk, angles_grp_q)
+                    angles_grp_k = self.rotary_pos_emb(g_pos[:t_end])
+                    k_chunk_grp = apply_rotary_pos_emb(k_chunk, angles_grp_k)
+                elif self.config.pe == 'xpos2':
+                    # Implement xpos2 positional encodings if needed
+                    pass
+
+                attn_scores_chunk_grp = torch.matmul(q_chunk_grp, k_chunk_grp.transpose(-2, -1)) * (
+                            1.0 / math.sqrt(head_dim))
+
+                # Merge attention scores using masks
+                mask_chunk = mask[t_start:t_end, :t_end]
+                attn_scores_chunk = torch.where(mask_chunk.unsqueeze(0).unsqueeze(0),
+                                                attn_scores_chunk_ngb,
+                                                attn_scores_chunk_grp)
+
+                # Apply causal mask
+                causal_mask_chunk = causal_mask[:, :, t_start:t_end, :t_end]
+                attn_scores_chunk = attn_scores_chunk.masked_fill(causal_mask_chunk == 0, float('-inf'))
+
+                # Apply configurations (score scaling, activations)
+                attn_scores_chunk = self._apply_additional_configs_inference(attn_scores_chunk)
+
+                # Compute attention probabilities
+                attn_probs_chunk = F.softmax(attn_scores_chunk, dim=-1)
+
+                # Apply probability modifications (top-k, top-p, etc.)
+                attn_probs_chunk = self._apply_probability_modifications(attn_probs_chunk)
+
+                # Compute weighted values
+                weighted_v_chunk = torch.matmul(attn_probs_chunk, v_chunk)
+                weighted_v[:, :, t_start:t_end, :] = weighted_v_chunk
+
+                # Collect information if needed
+                if collect_info:
+                    q_norms_chunk = q_chunk.norm(dim=-1)
+                    k_norms_chunk = k_chunk.norm(dim=-1)
+                    v_norms_chunk = v_chunk.norm(dim=-1)
+                    embedding_norms_chunk = x[:, t_start:t_end, :].norm(dim=-1).unsqueeze(1).expand(-1, self.n_head, -1)
+                    weighted_v_norms_chunk = weighted_v_chunk.norm(dim=-1)
+
+                    effective_top_k = min(5, attn_probs_chunk.size(-1))
+                    topk_values_to, topk_indices_to = torch.topk(attn_probs_chunk, k=effective_top_k, dim=-1)
+                    att_probs_T_chunk = attn_probs_chunk.transpose(-2, -1)
+                    topk_values_from, topk_indices_from = torch.topk(att_probs_T_chunk, k=effective_top_k, dim=-1)
+
+                    q_norms_list.append(q_norms_chunk)
+                    k_norms_list.append(k_norms_chunk)
+                    v_norms_list.append(v_norms_chunk)
+                    embedding_norms_list.append(embedding_norms_chunk)
+                    weighted_v_norms_list.append(weighted_v_norms_chunk)
+                    topk_values_to_list.append(topk_values_to)
+                    topk_indices_to_list.append(topk_indices_to)
+                    topk_values_from_list.append(topk_values_from)
+                    topk_indices_from_list.append(topk_indices_from)
+
+        else:
+            # Standard attention with chunking
+            for t_start in range(0, T, chunk_size):
+                t_end = min(t_start + chunk_size, T)
+                q_chunk = q[:, :, t_start:t_end, :]
+                k_chunk = k[:, :, :t_end, :]
+                v_chunk = v[:, :, :t_end, :]
+
+                # Apply positional encodings
+                if self.config.pe == 'rope':
+                    pos_q_chunk = pos[t_start:t_end]
+                    angles_q_chunk = self.rotary_pos_emb(pos_q_chunk)
+                    q_chunk = apply_rotary_pos_emb(q_chunk, angles_q_chunk)
+                    angles_k_chunk = self.rotary_pos_emb(pos[:t_end])
+                    k_chunk = apply_rotary_pos_emb(k_chunk, angles_k_chunk)
+                elif self.config.pe == 'xpos2':
+                    # Implement xpos2 positional encodings if needed
+                    pass
+
+                # Compute attention scores
+                attn_scores_chunk = torch.matmul(q_chunk, k_chunk.transpose(-2, -1)) * (1.0 / math.sqrt(head_dim))
+
+                # Apply causal mask
+                causal_mask = torch.tril(torch.ones(t_end, t_end, device=device)).unsqueeze(0).unsqueeze(0)
+                causal_mask_chunk = causal_mask[:, :, t_start:t_end, :t_end]
+                attn_scores_chunk = attn_scores_chunk.masked_fill(causal_mask_chunk == 0, float('-inf'))
+
+                # Apply additional masks and configurations per chunk (training-specific)
+                attn_scores_chunk = self._apply_additional_configs_training(attn_scores_chunk, t_start, t_end)
+
+                # Compute attention probabilities
+                attn_probs_chunk = F.softmax(attn_scores_chunk, dim=-1)
+
+                # Apply probability modifications (top-k, top-p, etc.)
+                attn_probs_chunk = self._apply_probability_modifications(attn_probs_chunk)
+
+                # Apply attention dropout
+                attn_probs_chunk = self.attn_dropout(attn_probs_chunk)
+
+                # Compute weighted values
+                weighted_v_chunk = torch.matmul(attn_probs_chunk, v_chunk)
+                weighted_v[:, :, t_start:t_end, :] = weighted_v_chunk
+
+                # Collect information if needed
+                if collect_info:
+                    q_norms_chunk = q_chunk.norm(dim=-1)
+                    k_norms_chunk = k_chunk.norm(dim=-1)
+                    v_norms_chunk = v_chunk.norm(dim=-1)
+                    embedding_norms_chunk = x[:, t_start:t_end, :].norm(dim=-1).unsqueeze(1).expand(-1, self.n_head, -1)
+                    weighted_v_norms_chunk = weighted_v_chunk.norm(dim=-1)
+
+                    effective_top_k = min(5, attn_probs_chunk.size(-1))
+                    topk_values_to, topk_indices_to = torch.topk(attn_probs_chunk, k=effective_top_k, dim=-1)
+                    att_probs_T_chunk = attn_probs_chunk.transpose(-2, -1)
+                    topk_values_from, topk_indices_from = torch.topk(att_probs_T_chunk, k=effective_top_k, dim=-1)
+
+                    q_norms_list.append(q_norms_chunk)
+                    k_norms_list.append(k_norms_chunk)
+                    v_norms_list.append(v_norms_chunk)
+                    embedding_norms_list.append(embedding_norms_chunk)
+                    weighted_v_norms_list.append(weighted_v_norms_chunk)
+                    topk_values_to_list.append(topk_values_to)
+                    topk_indices_to_list.append(topk_indices_to)
+                    topk_values_from_list.append(topk_values_from)
+                    topk_indices_from_list.append(topk_indices_from)
+
+        # Aggregate collected information if needed
+        if collect_info:
+            extra_info = {
+                'q_norms': torch.cat(q_norms_list, dim=-1),
+                'k_norms': torch.cat(k_norms_list, dim=-1),
+                'v_norms': torch.cat(v_norms_list, dim=-1),
+                'embedding_norms': torch.cat(embedding_norms_list, dim=-1),
+                'weighted_v_norms': torch.cat(weighted_v_norms_list, dim=-1),
+                'topk_indices_to': torch.cat(topk_indices_to_list, dim=-2),
+                'topk_values_to': torch.cat(topk_values_to_list, dim=-2),
+                'topk_indices_from': torch.cat(topk_indices_from_list, dim=-2),
+                'topk_values_from': torch.cat(topk_values_from_list, dim=-2),
+            }
+        else:
+            extra_info = None
+
+        return weighted_v, extra_info
+
+    def _create_merge_mask(self, T, w_size, device):
+        """
+        Creates a mask to merge normal and grouped attention scores based on self_extend logic.
+        """
+        # Create mask as per the original code
+        mask = torch.ones(T, T, device=device)
+        if T > w_size:
+            g_mask = torch.tril(torch.ones(T - w_size, T - w_size, device=device))
+            mask[w_size:, :-w_size] -= g_mask
+        mask = mask.bool()
+        return mask
+
+    def _apply_additional_configs_inference(self, attn_scores_chunk):
+        """
+        Applies configurations to the attention scores during inference.
+        """
+        # Apply score scaling and activations
+        if self.config.score_scale is not None and self.config.score_scale != 1.0:
+            attn_scores_chunk = torch.where(attn_scores_chunk < self.config.score_threshold,
+                                            attn_scores_chunk * self.config.score_scale,
+                                            attn_scores_chunk)
+
+        if self.config.relu_before_attn_softmax:
+            attn_scores_chunk = F.relu(attn_scores_chunk)
+            if self.config.relu_neg_inf:
+                attn_scores_chunk = attn_scores_chunk.masked_fill(attn_scores_chunk <= 0, float('-inf'))
+
+        if self.config.silu_before_attn_softmax:
+            attn_scores_chunk = F.silu(attn_scores_chunk)
+
+        return attn_scores_chunk
+
+    def _apply_additional_configs_training(self, attn_scores_chunk, t_start, t_end):
+        """
+        Applies additional masks and configurations to the attention scores per chunk during training.
+        """
+        device = attn_scores_chunk.device
+
+        # Apply local heads during training if configured
+        if self.training and self.local_heads_during_training > 0:
+            if self.local_heads_random:
+                head_indices = torch.randperm(self.n_head)[:self.local_heads_during_training]
+            else:
+                head_indices = torch.arange(self.local_heads_during_training, device=device)
+            local_heads_mask = torch.zeros(self.n_head, device=device, dtype=torch.bool)
+            local_heads_mask[head_indices] = True
+
+            i = torch.arange(t_start, t_end, device=device).view(-1, 1)
+            j = torch.arange(0, t_end, device=device).view(1, -1)
+            local_mask = (i - j >= self.local_window_size).bool()
+            local_mask = local_mask.unsqueeze(0).unsqueeze(0)
+            local_heads_mask_expanded = local_heads_mask.view(1, self.n_head, 1, 1)
+            attn_scores_chunk = attn_scores_chunk.masked_fill(local_heads_mask_expanded & local_mask, float('-inf'))
+
+        # Apply score scaling and activations
+        if self.config.score_scale is not None and self.config.score_scale != 1.0:
+            attn_scores_chunk = torch.where(attn_scores_chunk < self.config.score_threshold,
+                                            attn_scores_chunk * self.config.score_scale,
+                                            attn_scores_chunk)
+
+        if self.config.relu_before_attn_softmax:
+            attn_scores_chunk = F.relu(attn_scores_chunk)
+            if self.config.relu_neg_inf:
+                attn_scores_chunk = attn_scores_chunk.masked_fill(attn_scores_chunk <= 0, float('-inf'))
+
+        if self.config.silu_before_attn_softmax:
+            attn_scores_chunk = F.silu(attn_scores_chunk)
+
+        return attn_scores_chunk
+
+    def _apply_probability_modifications(self, attn_probs_chunk):
+        """
+        Applies probability modifications like top-k, top-p filtering to the attention probabilities.
+        """
+        # Apply top-k after softmax
+        if self.config.topk_after_attn_softmax > 0:
+            top_n_values, top_n_indices = torch.topk(attn_probs_chunk, self.config.topk_after_attn_softmax, dim=-1)
+            mask = torch.zeros_like(attn_probs_chunk)
+            mask.scatter_(-1, top_n_indices, 1.0)
+            attn_probs_chunk = attn_probs_chunk * mask
+            attn_probs_sum = attn_probs_chunk.sum(dim=-1, keepdim=True) + 1e-8
+            attn_probs_chunk = attn_probs_chunk / attn_probs_sum
+
+        # Apply top-p filtering
+        if self.config.top_p > 0:
+            sorted_probs, sorted_indices = torch.sort(attn_probs_chunk, descending=True, dim=-1)
+            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+            cumulative_mask = cumulative_probs <= self.config.top_p
+            cumulative_mask[..., 0] = True
+            sorted_probs = sorted_probs * cumulative_mask
+            sorted_probs_sum = sorted_probs.sum(dim=-1, keepdim=True) + 1e-8
+            sorted_probs = sorted_probs / sorted_probs_sum
+            attn_probs_chunk = torch.zeros_like(attn_probs_chunk).scatter_(-1, sorted_indices, sorted_probs)
+
+        # Apply min_p filtering
+        if self.config.min_p > 0:
+            max_probs, _ = torch.max(attn_probs_chunk, dim=-1, keepdim=True)
+            min_threshold = max_probs * self.config.min_p
+            min_p_mask = attn_probs_chunk >= min_threshold
+            attn_probs_chunk = attn_probs_chunk * min_p_mask
+            attn_probs_sum = attn_probs_chunk.sum(dim=-1, keepdim=True) + 1e-8
+            attn_probs_chunk = attn_probs_chunk / attn_probs_sum
+
+        # Apply top_a filtering
+        if self.config.top_a > 0:
+            max_probs, _ = torch.max(attn_probs_chunk, dim=-1, keepdim=True)
+            threshold = (max_probs ** 2) * self.config.top_a
+            top_a_mask = attn_probs_chunk >= threshold
+            attn_probs_chunk = attn_probs_chunk * top_a_mask
+            attn_probs_sum = attn_probs_chunk.sum(dim=-1, keepdim=True) + 1e-8
+            attn_probs_chunk = attn_probs_chunk / attn_probs_sum
+
+        return attn_probs_chunk
 
 class MLP(nn.Module):
 
@@ -419,6 +746,9 @@ class GPTConfig:
     silu_before_attn_softmax: bool = False
     score_threshold: float = 0.0
     score_scale: float = 1.0
+
+    use_pseudo_flash: bool = False
+    pseudo_flash_chunk_size: int = 1024
 
     def __post_init__(self):
         if self.base_scale is None:

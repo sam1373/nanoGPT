@@ -17,11 +17,29 @@ distractor_unit = "The grass is green. The sky is blue. The sun is yellow. Here 
 # print(f'distractor len: {len(distractor)}')
 needle = "One of the special magic numbers for jobless-speech is: 8090293."
 query = "What is the special magic number for jobless-speech mentioned in the provided text? The special magic number for jobless-speech mentioned in the provided text is"
+
+#n_distractors = 30
+#n_distractors = 150#3500
 #n_distractors = 160#4k
-n_distractors = 600
+#n_distractors = 200#5k
+#n_distractors = 300#7k
+#n_distractors = 400#10k
+#n_distractors = 500#12k
+#n_distractors = 600#14k
+#n_distractors = 700#17k
+#n_distractors = 750#18k
+#n_distractors = 775#19k
+#785 failed assertion
+#need pseudo
+#n_distractors = 850#20.5k
+#n_distractors = 900#22k
+#n_distractors = 1000#24k
+n_distractors = 1300#32k
+#n_distractors = 1500#36k
 distractor = ' '.join([distractor_unit] * n_distractors)
 print(f'distractor len: {len(distractor)}')
-needle_pos_within_distractor = 100
+#needle_pos_within_distractor = 100
+needle_pos_within_distractor = 60000 #16k?
 
 distractor_needle = distractor[:needle_pos_within_distractor] + " " + needle + " " + distractor[needle_pos_within_distractor:]
 
@@ -31,13 +49,13 @@ start = " ".join([instr, distractor_needle, query])
 start += ":"
 print(f'start len: {len(start)}, start: {start}')
 MAX_SEQ_LEN = 4096
-MAX_SEQ_LEN = 20000
+MAX_SEQ_LEN = 40000
 #MAX_SEQ_LEN = 40000#4096 # override what's in the checkpoint
 
 # -----------------------------------------------------------------------------
 init_from = 'resume' # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 'gpt2-xl')
 out_dir = 'out' # ignored if init_from is not 'resume'
-#start = "\n" # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
+#start = "\n" #Can also specify a file, use as: "FILE:prompt.txt"
 num_samples = 1 # number of samples to draw
 max_new_tokens = 3 # number of tokens generated in each sample
 temperature = 0.8 # 1.0 = no change, < 1.0 = less random, > 1.0 = more random, in predictions
@@ -45,8 +63,10 @@ temperature = 0.8 # 1.0 = no change, < 1.0 = less random, > 1.0 = more random, i
 top_k = 1 # greedy
 seed = 1337
 device = 'cuda' if torch.cuda.is_available() else 'mps'
-dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
+dtype = 'float32'#'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32' or 'bfloat16' or 'float16'
 compile = False # use PyTorch 2.0 to compile the model to be faster
+
+print(dtype)
 
 # Dima
 pe = 'rope' # examples: 'abs', 'rope', 'alibi', 'nope'
@@ -86,7 +106,7 @@ if init_from == 'resume':
     #ckpt_path = "ngpt_120M_rope_nonfa_val299.pt"
     #info_path = "ngpt_120M_rope_nonfa_val299.info"
 
-    ckpt_path = "ngpt_120M_rope_nonfa_relu_topk10_val308.pt"
+    #ckpt_path = "ngpt_120M_rope_nonfa_relu_topk10_val308.pt"
     #info_path = "ngpt_120M_rope_nonfa_relu_topk10_val308_4k.info"
     #info_path = "ngpt_120M_rope_nonfa_relu_topk10_val308_n_distr_" + str(n_distractors) + ".info"
 
@@ -102,11 +122,17 @@ if init_from == 'resume':
 
     #ckpt_path = "ngpt_120M_rope_nonfa_silu_val303.pt"
 
+    #ckpt_path = "ngpt_120M_rope_nonfa_relu_min_p_01.pt"
+
+    #ckpt_path = "ngpt_120M_rope_nonfa_scale_0_100.pt"
+
+    ckpt_path = "ngpt_120M_rope_nonfa_scale_0_100_locheads9_rand_topk10.pt"
+
 
     checkpoint = torch.load(ckpt_path, map_location=device)
 
     #checkpoint['model_args']['pe'] = pe
-    checkpoint['model_args']['precision'] = 'float16'
+    checkpoint['model_args']['precision'] = 'float32'
     checkpoint['model_args']['flash'] = flash
     checkpoint['model_args']['block_size'] = MAX_SEQ_LEN
 
@@ -114,13 +140,19 @@ if init_from == 'resume':
     #checkpoint['model_args']['use_nGPT'] = True
     checkpoint['model_args']['self_extend'] = True
 
-    #checkpoint['model_args']['relu_before_attn_softmax'] = True
+    #checkpoint['model_args']['relu_before_attn_softmax'] = False
 
     #checkpoint['model_args']['rope_base'] = 100000
 
     #checkpoint['model_args']['softmax_log_k'] = 0.1
     #checkpoint['model_args']['relu_instead_of_attn_softmax'] = True
-    checkpoint['model_args']['topk_after_attn_softmax'] = 10
+
+    checkpoint['model_args']['topk_after_attn_softmax'] = 0
+    checkpoint['model_args']['min_p'] = 0.1
+
+    checkpoint['model_args']['use_pseudo_flash'] = True
+    checkpoint['model_args']['pseudo_flash_chunk_size'] = 4096
+
 
     #checkpoint['model_args']['window_size'] = 512
 
@@ -141,7 +173,8 @@ elif init_from.startswith('gpt2'):
     model = GPT.from_pretrained(init_from, dict(dropout=0.0))
 
 model.eval()
-model.to(device)
+model = model.to(device)
+model = model.to(dtype=ptdtype)
 if compile:
     model = torch.compile(model) # requires PyTorch 2.0 (optional)
 
