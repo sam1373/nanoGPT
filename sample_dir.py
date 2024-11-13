@@ -7,6 +7,7 @@ import json
 import pickle
 from contextlib import nullcontext
 from collections import defaultdict
+import pandas as pd  # Added for Excel file creation
 
 import torch
 import tiktoken
@@ -14,10 +15,10 @@ from model import GPTConfig, GPT
 import logging
 
 # Directory containing the JSONL files
-data_directory = 'ruler_tasks/32k'  # Replace with your directory path
+data_directory = 'ruler_tasks/4k'  # Replace with your directory path
 
 # Number of samples to process from each file
-samples_per_file = 3  # Adjust as needed
+samples_per_file = 1  # Adjust as needed
 
 # List of checkpoint file paths
 checkpoint_paths = [
@@ -290,7 +291,7 @@ for ckpt_path in checkpoint_paths:
                         print(f"First expected token not found in generated output for sample index {index}")
                         # For this sample, find the maximum probability assigned to any starting token of expected outputs in top 10 at any position
                         max_confidence = 0.0
-                        for i, next_probs in enumerate(next_token_prob_list):
+                        for next_probs in next_token_prob_list:
                             for prob_info in next_probs:
                                 if prob_info['token_id'] in expected_first_token_ids:
                                     if prob_info['probability'] > max_confidence:
@@ -343,20 +344,22 @@ for ckpt_path in checkpoint_paths:
             average_expected_output_token_length = total_expected_output_token_length / total_samples
 
             results[model_name][filename] = {
-                'accuracy': accuracy,
-                'average_token_match': average_token_match,
-                'total_samples': total_samples,
-                'correct_predictions': correct_predictions,
-                'average_input_token_length': average_input_token_length,
-                'average_expected_output_token_length': average_expected_output_token_length,
-                'min_pos_all': min_pos_all,
-                'avg_pos_all': avg_pos_all,
-                'max_pos_all': max_pos_all,
-                'min_pos_correct': min_pos_correct,
-                'avg_pos_correct': avg_pos_correct,
-                'max_pos_correct': max_pos_correct,
-                'average_confidence': average_confidence,
-                'average_max_confidence_in_incorrect': average_max_confidence_in_incorrect,
+                'Model': model_name,
+                'File': filename,
+                'Accuracy (%)': accuracy,
+                'Correct Predictions': correct_predictions,
+                'Total Samples': total_samples,
+                'Average Token Match (%)': average_token_match,
+                'Average Input Token Length': average_input_token_length,
+                'Average Expected Output Token Length': average_expected_output_token_length,
+                'Min Position (All Samples)': min_pos_all,
+                'Avg Position (All Samples)': avg_pos_all,
+                'Max Position (All Samples)': max_pos_all,
+                'Min Position (Correct Predictions)': min_pos_correct,
+                'Avg Position (Correct Predictions)': avg_pos_correct,
+                'Max Position (Correct Predictions)': max_pos_correct,
+                'Average Confidence in First Correct Token': average_confidence,
+                'Average Max Confidence in Incorrect Samples': average_max_confidence_in_incorrect,
             }
             print(f"\nResults for model '{model_name}' on file '{filename}':")
             print(f"Accuracy: {accuracy:.2f}% ({correct_predictions}/{total_samples})")
@@ -372,16 +375,27 @@ for ckpt_path in checkpoint_paths:
 
 # After all models and files are processed, print concise stats
 print("\nFinal Results Summary:")
+# Prepare data for Excel file
+excel_data = []
+
 for model_name in results:
     print(f"\nModel: {model_name}")
     for filename in results[model_name]:
         res = results[model_name][filename]
         print(f"  File: {filename}")
-        print(f"    Accuracy: {res['accuracy']:.2f}% ({res['correct_predictions']}/{res['total_samples']})")
-        print(f"    Average token match: {res['average_token_match']:.2f}%")
-        print(f"    Average input token length: {res['average_input_token_length']:.2f}")
-        print(f"    Average expected output token length: {res['average_expected_output_token_length']:.2f}")
-        print(f"    Expected output positions in input (all samples): min={res['min_pos_all']}, avg={res['avg_pos_all']}, max={res['max_pos_all']}")
-        print(f"    Expected output positions in input (correct predictions): min={res['min_pos_correct']}, avg={res['avg_pos_correct']}, max={res['max_pos_correct']}")
-        print(f"    Average confidence in first correct token: {res['average_confidence']}")
-        print(f"    Average max confidence in starting expected tokens in incorrect samples: {res['average_max_confidence_in_incorrect']}")
+        print(f"    Accuracy: {res['Accuracy (%)']:.2f}% ({res['Correct Predictions']}/{res['Total Samples']})")
+        print(f"    Average token match: {res['Average Token Match (%)']:.2f}%")
+        print(f"    Average input token length: {res['Average Input Token Length']:.2f}")
+        print(f"    Average expected output token length: {res['Average Expected Output Token Length']:.2f}")
+        print(f"    Expected output positions in input (all samples): min={res['Min Position (All Samples)']}, avg={res['Avg Position (All Samples)']}, max={res['Max Position (All Samples)']}")
+        print(f"    Expected output positions in input (correct predictions): min={res['Min Position (Correct Predictions)']}, avg={res['Avg Position (Correct Predictions)']}, max={res['Max Position (Correct Predictions)']}")
+        print(f"    Average confidence in first correct token: {res['Average Confidence in First Correct Token']}")
+        print(f"    Average max confidence in starting expected tokens in incorrect samples: {res['Average Max Confidence in Incorrect Samples']}")
+        # Add to excel_data
+        excel_data.append(res)
+
+# Create a DataFrame and save to Excel
+df = pd.DataFrame(excel_data)
+excel_file_name = 'results_summary4k.xlsx'
+df.to_excel(excel_file_name, index=False)
+print(f"\nResults have been saved to '{excel_file_name}'.")
