@@ -1259,6 +1259,8 @@ class GPT(nn.Module):
                 next_token_probs_per_layer.append(next_token_probs_layer)
             token_info['next_token_probs_per_layer'] = next_token_probs_per_layer
 
+        next_token_probs_list = []
+
         # Start generating new tokens
         for t in tqdm(range(max_new_tokens), desc="Generating tokens"):
             idx_cond = idx[:, -self.config.block_size:] if idx.size(1) > self.config.block_size else idx
@@ -1412,8 +1414,9 @@ class GPT(nn.Module):
                     token_norms.append(token_norm)
                     generated_info.append(token_info)
 
-            print(decoded_token)
-            print(next_token_probs)
+            #print(decoded_token)
+            #print(next_token_probs)
+            next_token_probs_list.append(next_token_probs)
 
             #if decoded_token not in [':', '8', '090', '293', ' 8', ' 090', ' 293']:
             #    break
@@ -1448,4 +1451,4 @@ class GPT(nn.Module):
             if collect_probs_per_layer:
                 return idx, logits_per_layer_generated
             else:
-                return idx
+                return idx, next_token_probs_list

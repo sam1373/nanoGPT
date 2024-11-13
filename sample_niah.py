@@ -20,7 +20,7 @@ query = "What is the special magic number for jobless-speech mentioned in the pr
 
 #n_distractors = 30
 #n_distractors = 150#3500
-#n_distractors = 160#4k
+n_distractors = 160#4k
 #n_distractors = 200#5k
 #n_distractors = 300#7k
 #n_distractors = 400#10k
@@ -34,7 +34,7 @@ query = "What is the special magic number for jobless-speech mentioned in the pr
 #n_distractors = 850#20.5k
 #n_distractors = 900#22k
 #n_distractors = 1000#24k
-n_distractors = 1300#32k
+#n_distractors = 1300#32k
 #n_distractors = 1500#36k
 distractor = ' '.join([distractor_unit] * n_distractors)
 print(f'distractor len: {len(distractor)}')
@@ -264,7 +264,10 @@ with torch.no_grad():
 
                 logging.info('---------------')
             else:
-                y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k, decode=decode)
+                y, next_token_prob_list = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k, decode=decode)
+
+                print(next_token_prob_list)
+
                 out = decode(y[0].tolist())
                 logging.info(f'input: "{start}"')
                 logging.info(f'input end: "{out[len(start)-100:len(start)]}"')
