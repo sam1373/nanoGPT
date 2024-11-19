@@ -55,6 +55,33 @@ n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+pe = 'abs' # examples: 'abs', 'rope', 'alibi', 'nope', 'xpos2'
+flash = True # examples: 'True', 'False'
+rope_base = 10000 # RoPE base
+xpos2_decay_base = 2.0 # Decay base
+xpos2_decay_angle = math.pi / 2 # Soft max angle
+xpos2_adaptive = True # Should we change decay angle if there's risk of overflow
+scaling_target_sequence_length = None
+softmax_log_k = 0.0
+use_nGPT = 0
+base_scale = None
+relu_instead_of_attn_softmax = False
+topk_after_attn_softmax = 0
+relu_neg_inf = False
+pretraining_seq_length = block_size
+window_size = 128
+self_extend = False
+head_dropout = 0
+local_heads_during_training = 0
+local_window_size = 128
+local_heads_random = False
+top_p = 0.0
+min_p = 0.0
+top_a = 0.0
+silu_before_attn_softmax = False
+score_threshold = 0.0
+score_scale = 1.0
+
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -74,21 +101,6 @@ device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps'
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
 
-# Dima
-pe = 'abs' # examples: 'abs', 'rope', 'alibi', 'nope'
-flash = True # examples: 'True', 'False'
-loglevel = 'info'
-#
-scaling_target_sequence_length = None
-#
-softmax_log_k = 0.0
-#
-relu_instead_of_attn_softmax = False
-topk_after_attn_softmax = 0
-#
-use_nGPT = 0
-base_scale = None
-pretraining_seq_length = block_size
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -163,12 +175,41 @@ if os.path.exists(meta_path):
     logging.info(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
 # model init
-model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  pe=pe,flash=flash,scaling_target_sequence_length=scaling_target_sequence_length, softmax_log_k=softmax_log_k,
-                  relu_instead_of_attn_softmax=relu_instead_of_attn_softmax, topk_after_attn_softmax=topk_after_attn_softmax,
-                  use_nGPT=use_nGPT, base_scale=base_scale,
-                  pretraining_seq_length=pretraining_seq_length,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+model_args = dict(
+    n_layer=n_layer,
+    n_head=n_head,
+    n_embd=n_embd,
+    block_size=block_size,
+    vocab_size=vocab_size,
+    dropout=dropout,
+    bias=bias,
+    pe=pe,
+    flash=flash,
+    rope_base=rope_base,
+    xpos2_decay_base=xpos2_decay_base,
+    xpos2_decay_angle=xpos2_decay_angle,
+    xpos2_adaptive=xpos2_adaptive,
+    scaling_target_sequence_length=scaling_target_sequence_length,
+    softmax_log_k=softmax_log_k,
+    use_nGPT=use_nGPT,
+    base_scale=base_scale,
+    relu_instead_of_attn_softmax=relu_instead_of_attn_softmax,
+    topk_after_attn_softmax=topk_after_attn_softmax,
+    relu_neg_inf=relu_neg_inf,
+    pretraining_seq_length=pretraining_seq_length,
+    window_size=window_size,
+    self_extend=self_extend,
+    head_dropout=head_dropout,
+    local_heads_during_training=local_heads_during_training,
+    local_window_size=local_window_size,
+    local_heads_random=local_heads_random,
+    top_p=top_p,
+    min_p=min_p,
+    top_a=top_a,
+    silu_before_attn_softmax=silu_before_attn_softmax,
+    score_threshold=score_threshold,
+    score_scale=score_scale,
+)
 if init_from == 'scratch':
     # init a new model from scratch
     logging.info("Initializing a new model from scratch")
