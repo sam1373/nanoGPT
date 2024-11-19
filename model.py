@@ -151,9 +151,11 @@ class CausalSelfAttention(nn.Module):
         #q = q * 1.6
 
         if self.flash:
-            q = q.to(torch.bfloat16)
-            k = k.to(torch.bfloat16)
-            v = v.to(torch.bfloat16)
+            q = q.to(torch.float16)
+            k = k.to(torch.float16)
+            v = v.to(torch.float16)
+
+        if self.flash and not self.config.use_pseudo_flash:
 
             y = flash_attn_func(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
                                 dropout_p=self.dropout if self.training else 0, softmax_scale=None, causal=True,
@@ -163,10 +165,10 @@ class CausalSelfAttention(nn.Module):
             # Use pseudo-flash attention
             weighted_v, extra_info = self.pseudo_flash_attention(q, k, v, pos, x, collect_info)
         else:
-            if self.config.self_extend and T > self.config.pretraining_seq_length:
+            if self.config.self_extend and T > self.config.pretraining_seq_length and self.config.pe == 'rope':
                 # Compute group size dynamically
                 denominator = max((self.config.pretraining_seq_length - self.config.window_size), 1)
-                g_size = (T - self.config.window_size + denominator - 1) // denominator * 2
+                g_size = (T - self.config.window_size + denominator - 1) // denominator * 32
                 g_size = max(g_size, 1)
 
 
@@ -369,7 +371,7 @@ class CausalSelfAttention(nn.Module):
             topk_indices_from_list = []
 
         # Check if self_extend is enabled
-        if self.config.self_extend and T > self.config.pretraining_seq_length:
+        if self.config.self_extend and T > self.config.pretraining_seq_length and self.config.pe == 'rope':
             # Assume self_extend is only used in inference
             # Compute group size dynamically
             denominator = max((self.config.pretraining_seq_length - self.config.window_size), 1)
@@ -391,56 +393,141 @@ class CausalSelfAttention(nn.Module):
 
             for t_start in (range(0, T, chunk_size)):
                 t_end = min(t_start + chunk_size, T)
+                t_chunk = t_end - t_start
                 q_chunk = q[:, :, t_start:t_end, :]
 
                 # Prepare k and v up to t_end for causal attention
                 k_chunk = k[:, :, :t_end, :]
                 v_chunk = v[:, :, :t_end, :]
 
-                # Compute normal attention scores (ngb_attn)
-                if self.config.pe == 'rope':
-                    angles_ngb_q = self.rotary_pos_emb(pos[t_start:t_end])
-                    q_chunk_ngb = apply_rotary_pos_emb(q_chunk, angles_ngb_q)
-                    angles_ngb_k = self.rotary_pos_emb(pos[:t_end])
-                    k_chunk_ngb = apply_rotary_pos_emb(k_chunk, angles_ngb_k)
-                elif self.config.pe == 'xpos2':
-                    # Implement xpos2 positional encodings if needed
-                    pass
+                if not self.config.flash:
 
-                attn_scores_chunk_ngb = torch.matmul(q_chunk_ngb, k_chunk_ngb.transpose(-2, -1)) * (
-                            1.0 / math.sqrt(head_dim))
+                    # Compute normal attention scores (ngb_attn)
+                    if self.config.pe == 'rope':
+                        angles_ngb_q = self.rotary_pos_emb(pos[t_start:t_end])
+                        q_chunk_ngb = apply_rotary_pos_emb(q_chunk, angles_ngb_q)
+                        angles_ngb_k = self.rotary_pos_emb(pos[:t_end])
+                        k_chunk_ngb = apply_rotary_pos_emb(k_chunk, angles_ngb_k)
+                    elif self.config.pe == 'xpos2':
+                        # Implement xpos2 positional encodings if needed
+                        pass
 
-                # Compute grouped attention scores (g_attn)
-                if self.config.pe == 'rope':
-                    angles_grp_q = self.rotary_pos_emb(s_g_pos[t_start:t_end])
-                    q_chunk_grp = apply_rotary_pos_emb(q_chunk, angles_grp_q)
-                    angles_grp_k = self.rotary_pos_emb(g_pos[:t_end])
-                    k_chunk_grp = apply_rotary_pos_emb(k_chunk, angles_grp_k)
-                elif self.config.pe == 'xpos2':
-                    # Implement xpos2 positional encodings if needed
-                    pass
+                    attn_scores_chunk_ngb = torch.matmul(q_chunk_ngb, k_chunk_ngb.transpose(-2, -1)) * (
+                                1.0 / math.sqrt(head_dim))
 
-                attn_scores_chunk_grp = torch.matmul(q_chunk_grp, k_chunk_grp.transpose(-2, -1)) * (
-                            1.0 / math.sqrt(head_dim))
+                    # Compute grouped attention scores (g_attn)
+                    if self.config.pe == 'rope':
+                        angles_grp_q = self.rotary_pos_emb(s_g_pos[t_start:t_end])
+                        q_chunk_grp = apply_rotary_pos_emb(q_chunk, angles_grp_q)
+                        angles_grp_k = self.rotary_pos_emb(g_pos[:t_end])
+                        k_chunk_grp = apply_rotary_pos_emb(k_chunk, angles_grp_k)
+                    elif self.config.pe == 'xpos2':
+                        # Implement xpos2 positional encodings if needed
+                        pass
 
-                # Merge attention scores using masks
-                mask_chunk = mask[t_start:t_end, :t_end]
-                attn_scores_chunk = torch.where(mask_chunk.unsqueeze(0).unsqueeze(0),
-                                                attn_scores_chunk_ngb,
-                                                attn_scores_chunk_grp)
+                    attn_scores_chunk_grp = torch.matmul(q_chunk_grp, k_chunk_grp.transpose(-2, -1)) * (
+                                1.0 / math.sqrt(head_dim))
 
-                # Apply causal mask
-                causal_mask_chunk = causal_mask[:, :, t_start:t_end, :t_end]
-                attn_scores_chunk = attn_scores_chunk.masked_fill(causal_mask_chunk == 0, float('-inf'))
+                    # Merge attention scores using masks
+                    mask_chunk = mask[t_start:t_end, :t_end]
+                    attn_scores_chunk = torch.where(mask_chunk.unsqueeze(0).unsqueeze(0),
+                                                    attn_scores_chunk_ngb,
+                                                    attn_scores_chunk_grp)
 
-                # Apply configurations (score scaling, activations)
-                attn_scores_chunk = self._apply_additional_configs_inference(attn_scores_chunk)
+                    # Apply causal mask
+                    causal_mask_chunk = causal_mask[:, :, t_start:t_end, :t_end]
+                    attn_scores_chunk = attn_scores_chunk.masked_fill(causal_mask_chunk == 0, float('-inf'))
 
-                # Compute attention probabilities
-                attn_probs_chunk = F.softmax(attn_scores_chunk, dim=-1)
+                    # Apply configurations (score scaling, activations)
+                    attn_scores_chunk = self._apply_additional_configs_inference(attn_scores_chunk)
 
-                # Apply probability modifications (top-k, top-p, etc.)
-                attn_probs_chunk = self._apply_probability_modifications(attn_probs_chunk)
+                    # Compute attention probabilities
+                    attn_probs_chunk = F.softmax(attn_scores_chunk, dim=-1)
+
+                    # Apply probability modifications (top-k, top-p, etc.)
+                    attn_probs_chunk = self._apply_probability_modifications(attn_probs_chunk)
+                else:
+                    # Apply positional encodings
+                    if self.config.pe == 'rope':
+                        # Neighbor attention positional embeddings
+                        angles_q_neighbor = self.rotary_pos_emb(pos[t_start:t_end])
+                        q_chunk_neighbor = apply_rotary_pos_emb(q_chunk, angles_q_neighbor)
+
+                        angles_k_neighbor = self.rotary_pos_emb(pos[:t_end])
+                        k_chunk_neighbor = apply_rotary_pos_emb(k_chunk, angles_k_neighbor)
+
+                        # Group attention positional embeddings
+                        angles_q_group = self.rotary_pos_emb(s_g_pos[t_start:t_end])
+                        q_chunk_group = apply_rotary_pos_emb(q_chunk, angles_q_group)
+
+                        angles_k_group = self.rotary_pos_emb(g_pos[:t_end])
+                        k_chunk_group = apply_rotary_pos_emb(k_chunk, angles_k_group)
+                    elif self.config.pe == 'xpos2':
+                        # Implement xpos2 positional encodings if needed
+                        pass
+
+                    # Define window sizes
+                    window_size_neighbor = [w_size - 1, 0]  # Left window size
+                    window_size_group = [-1, -1]  # No window (full attention)
+
+                    # Attention masks
+                    causal = True  # Ensure causal masking
+
+                    # Set dropout_p > 0 to get softmax_lse and attention probabilities
+                    dropout_p = 0.0001
+
+                    # Call flash_attn_func for neighbor attention
+                    _, softmax_lse_neighbor, attn_probs_neighbor = flash_attn_func(
+                        q_chunk_neighbor.transpose(1, 2),  # (B, t_chunk, n_head, head_dim)
+                        k_chunk_neighbor.transpose(1, 2),
+                        v_chunk.transpose(1, 2),
+                        dropout_p=dropout_p,
+                        causal=causal,
+                        window_size=window_size_neighbor,
+                        return_attn_probs=True,
+                    )
+
+                    # Call flash_attn_func for group attention
+                    _, softmax_lse_group, attn_probs_group = flash_attn_func(
+                        q_chunk_group.transpose(1, 2),
+                        k_chunk_group.transpose(1, 2),
+                        v_chunk.transpose(1, 2),
+                        dropout_p=dropout_p,
+                        causal=causal,
+                        window_size=window_size_group,
+                        return_attn_probs=True,
+                    )
+
+                    # Reshape outputs to (B, n_head, t_chunk, head_dim)
+                    #attn_output_neighbor = attn_output_neighbor.permute(0, 2, 1, 3)
+                    #attn_output_group = attn_output_group.permute(0, 2, 1, 3)
+
+                    # Use softmax_lse returned by flash_attn_func
+                    # Shape of softmax_lse: (B, t_chunk, n_head)
+                    # Compute blending factor using lse_gap
+                    lse_gap = softmax_lse_group - softmax_lse_neighbor  # (B, t_chunk, n_head)
+                    blending_factor = torch.sigmoid(lse_gap).unsqueeze(-1)  # (B, t_chunk, n_head, 1)
+
+                    # Merge attention probabilities
+                    # Reshape attn_probs to (B, n_head, t_chunk, t_end)
+                    attn_probs_neighbor = attn_probs_neighbor.permute(0, 2, 1, 3)
+                    attn_probs_group = attn_probs_group.permute(0, 2, 1, 3)
+
+                    # Apply causal mask to attention probabilities
+                    #causal_mask_chunk = torch.tril(torch.ones(t_chunk, t_end, device=device)).unsqueeze(0).unsqueeze(
+                    #    0).bool()
+                    #attn_probs_neighbor = attn_probs_neighbor.masked_fill(~causal_mask_chunk, 0.0)
+                    #attn_probs_group = attn_probs_group.masked_fill(~causal_mask_chunk, 0.0)
+
+                    # Merge attention probabilities using blending factor
+                    attn_probs_chunk = attn_probs_neighbor * blending_factor + attn_probs_group * (
+                                1 - blending_factor)
+
+                    # Apply attention modifications
+                    attn_probs_chunk = self._apply_probability_modifications(attn_probs_chunk)
+
+                    # Apply attention dropout
+                    attn_probs_chunk = self.attn_dropout(attn_probs_chunk)
 
                 # Compute weighted values
                 weighted_v_chunk = torch.matmul(attn_probs_chunk, v_chunk)
