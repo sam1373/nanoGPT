@@ -43,14 +43,14 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.config = config
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias, dtype=self.config.dtype)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias, dtype=self.config.dtype)
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        self.config = config
         self.head_dropout = config.head_dropout
         self.local_heads_during_training = config.local_heads_during_training
         self.local_window_size = config.local_window_size
@@ -86,8 +86,8 @@ class CausalSelfAttention(nn.Module):
         else:
             self.flash = False
 
-        if not self.flash:
-            self.bias = torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size)
+        #if not self.flash and not self.use_pseudo_flash:
+        #    self.bias = torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size)
 
         if config.use_nGPT == 1:
             self.sqk_init_value = 1.0
@@ -387,11 +387,7 @@ class CausalSelfAttention(nn.Module):
             # Compute shifted grouped positions
             s_g_pos = g_pos + shift
 
-            # Precompute masks and causal masks
-            mask = self._create_merge_mask(T, w_size, device)
-            causal_mask = torch.tril(torch.ones(T, T, device=device)).unsqueeze(0).unsqueeze(0)
-
-            for t_start in (range(0, T, chunk_size)):
+            for t_start in range(0, T, chunk_size):
                 t_end = min(t_start + chunk_size, T)
                 t_chunk = t_end - t_start
                 q_chunk = q[:, :, t_start:t_end, :]
@@ -413,7 +409,7 @@ class CausalSelfAttention(nn.Module):
                         pass
 
                     attn_scores_chunk_ngb = torch.matmul(q_chunk_ngb, k_chunk_ngb.transpose(-2, -1)) * (
-                                1.0 / math.sqrt(head_dim))
+                            1.0 / math.sqrt(head_dim))
 
                     # Compute grouped attention scores (g_attn)
                     if self.config.pe == 'rope':
@@ -426,17 +422,22 @@ class CausalSelfAttention(nn.Module):
                         pass
 
                     attn_scores_chunk_grp = torch.matmul(q_chunk_grp, k_chunk_grp.transpose(-2, -1)) * (
-                                1.0 / math.sqrt(head_dim))
+                            1.0 / math.sqrt(head_dim))
 
-                    # Merge attention scores using masks
-                    mask_chunk = mask[t_start:t_end, :t_end]
+                    # Compute the merge mask chunk
+                    mask_chunk = self._compute_merge_mask_chunk(t_start, t_end, T, w_size, device)
+
+                    # Merge attention scores using the mask chunk
                     attn_scores_chunk = torch.where(mask_chunk.unsqueeze(0).unsqueeze(0),
                                                     attn_scores_chunk_ngb,
                                                     attn_scores_chunk_grp)
 
+                    # Compute the causal mask chunk
+                    causal_mask_chunk = self._compute_causal_mask_chunk(t_start, t_end, device)
+
                     # Apply causal mask
-                    causal_mask_chunk = causal_mask[:, :, t_start:t_end, :t_end]
-                    attn_scores_chunk = attn_scores_chunk.masked_fill(causal_mask_chunk == 0, float('-inf'))
+                    attn_scores_chunk = attn_scores_chunk.masked_fill(~causal_mask_chunk.unsqueeze(0).unsqueeze(0),
+                                                                      float('-inf'))
 
                     # Apply configurations (score scaling, activations)
                     attn_scores_chunk = self._apply_additional_configs_inference(attn_scores_chunk)
@@ -640,17 +641,34 @@ class CausalSelfAttention(nn.Module):
 
         return weighted_v, extra_info
 
-    def _create_merge_mask(self, T, w_size, device):
+    def _compute_merge_mask_chunk(self, t_start, t_end, T, w_size, device):
         """
-        Creates a mask to merge normal and grouped attention scores based on self_extend logic.
+        Computes the merge mask for a specific chunk without keeping the entire mask in memory.
         """
-        # Create mask as per the original code
-        mask = torch.ones(T, T, device=device)
-        if T > w_size:
-            g_mask = torch.tril(torch.ones(T - w_size, T - w_size, device=device))
-            mask[w_size:, :-w_size] -= g_mask
-        mask = mask.bool()
-        return mask
+        t_chunk = t_end - t_start
+        i = torch.arange(t_start, t_end, device=device).unsqueeze(1)  # Shape: [t_chunk, 1]
+        j = torch.arange(t_end, device=device).unsqueeze(0)  # Shape: [1, t_end]
+
+        # Conditions based on the original mask logic
+        cond1 = i >= w_size
+        cond2 = j < T - w_size
+        cond3 = (i - w_size) >= j
+
+        # Compute the mask chunk
+        mask_chunk = ~(cond1 & cond2 & cond3)
+        return mask_chunk
+
+    def _compute_causal_mask_chunk(self, t_start, t_end, device):
+        """
+        Computes the causal mask for a specific chunk without keeping the entire mask in memory.
+        """
+        t_chunk = t_end - t_start
+        i = torch.arange(t_start, t_end, device=device).unsqueeze(1)  # Shape: [t_chunk, 1]
+        j = torch.arange(t_end, device=device).unsqueeze(0)  # Shape: [1, t_end]
+
+        # Causal mask condition
+        causal_mask_chunk = i >= j
+        return causal_mask_chunk
 
     def _apply_additional_configs_inference(self, attn_scores_chunk):
         """
@@ -790,7 +808,7 @@ class MLP(nn.Module):
 @dataclass
 class GPTConfig:
     block_size: int = 1024
-    vocab_size: int = 50304  # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
+    vocab_size: int = 50304
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
@@ -842,6 +860,7 @@ class GPTConfig:
             self.base_scale = 1.0 / (self.n_embd ** 0.5)
         if self.pretraining_seq_length is None:
             self.pretraining_seq_length = 1024  # Default pretraining sequence length
+        self.dtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[self.precision]
 
 class Block(nn.Module):
 
@@ -856,11 +875,11 @@ class Block(nn.Module):
         if config.use_nGPT == 1:
             self.attn_alpha_init_value = 0.05
             self.attn_alpha_init_scaling = config.base_scale
-            self.attn_alpha = nn.Parameter(self.attn_alpha_init_scaling * torch.ones(config.n_embd, dtype=torch.float32))
+            self.attn_alpha = nn.Parameter(self.attn_alpha_init_scaling * torch.ones(config.n_embd, dtype=self.config.dtype))
 
             self.mlp_alpha_init_value = 0.05
             self.mlp_alpha_init_scaling = config.base_scale
-            self.mlp_alpha = nn.Parameter(self.mlp_alpha_init_scaling * torch.ones(config.n_embd, dtype=torch.float32))
+            self.mlp_alpha = nn.Parameter(self.mlp_alpha_init_scaling * torch.ones(config.n_embd, dtype=self.config.dtype))
 
     def justnorm(self, x):
         res = x / x.norm(p=2, dim=-1, keepdim=True)
@@ -968,7 +987,7 @@ class GPT(nn.Module):
         if config.use_nGPT == 1:
             self.sz_init_value = 1.00
             self.sz_init_scaling = config.base_scale
-            self.sz = nn.Parameter(self.sz_init_scaling * torch.ones(config.vocab_size, dtype=torch.float32))
+            self.sz = nn.Parameter(self.sz_init_scaling * torch.ones(config.vocab_size, dtype=self.config.dtype))
 
         # Report number of parameters
         logging.info("Number of parameters: %.2fM" % (self.get_num_params() / 1e6,))
@@ -1501,8 +1520,8 @@ class GPT(nn.Module):
                     token_norms.append(token_norm)
                     generated_info.append(token_info)
 
-            #print(decoded_token)
-            #print(next_token_probs)
+            print(decoded_token)
+            print(next_token_probs)
             next_token_probs_list.append(next_token_probs)
 
             #if decoded_token not in [':', '8', '090', '293', ' 8', ' 090', ' 293']:

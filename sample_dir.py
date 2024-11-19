@@ -15,32 +15,38 @@ from model import GPTConfig, GPT
 import logging
 
 # Directory containing the JSONL files
-data_directory = 'ruler_tasks/4k'  # Replace with your directory path
+data_directory = 'ruler_tasks/64k'  # Replace with your directory path
 
 # Number of samples to process from each file
 samples_per_file = 1  # Adjust as needed
 
 # List of checkpoint file paths
 checkpoint_paths = [
-    #"ngpt_120M_rope_nonfa_val299.pt",
+    # "ngpt_120M_rope_nonfa_val299.pt",
     # "ngpt_120M_rope_nonfa_relu_min_p_01.pt",
     # "ngpt_120M_rope_nonfa_scale_0_100_locheads9_rand_topk10.pt",
-    "ngpt_120M_rope_nonfa_locheads9_rand_min_p_02.pt",
-   # "ngpt_120M_rope_nonfa_relu_min_p_01.pt",
-   # "ngpt_120M_rope_nonfa_min_p_01_val306.pt",
-   # "ngpt_120M_rope_nonfa_locheads9_rand_val302.pt",
-   # "ngpt_120M_rope_nonfa_locheads9_rand_topk10_val319.pt",
+    #"ngpt_120M_rope_nonfa_locheads9_rand_min_p_02_2.pt",
+    # "ngpt_120M_rope_nonfa_relu_min_p_01.pt",
+    # "ngpt_120M_rope_nonfa_min_p_01_val306.pt",
+    # "ngpt_120M_rope_nonfa_locheads9_rand_val302.pt",
+    # "ngpt_120M_rope_nonfa_locheads9_rand_topk10_val319.pt",
+    #"ngpt_120M_rope_nonfa_nowd_2.pt",
+    #"ngpt_120M_nope_nonfa_nowd_2.pt",
+    "ngpt_120M_rope_nonfa_locheads9_rand_min_p_02_nowd_2.pt",
+    #"ngpt_120M_nope_nonfa_rand_min_p_02_nowd_2.pt",
+    #"ngpt_120M_nope_nonfa_locheads9_rand_min_p_02_nowd_2.pt",
+    #"ngpt_120M_rope_nonfa_locheads9_rand_win16_min_p_02_nowd_2.pt",
 ]
 
 # -----------------------------------------------------------------------------
 init_from = 'resume'  # 'resume' or a GPT-2 variant (e.g., 'gpt2-xl')
 out_dir = 'out'  # Ignored if init_from is not 'resume'
 # Removed global max_new_tokens
-temperature = 0.8  # Temperature for sampling
+temperature = 1.0  # Temperature for sampling
 top_k = 1  # Use top-k sampling (1 for greedy decoding)
 seed = 1337
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-dtype = 'float32'  # 'float32', 'bfloat16', or 'float16'
+precision = 'float32'  # 'float32', 'bfloat16', or 'float16'
 compile = False  # Use PyTorch 2.0 to compile the model for faster inference
 
 pe = 'rope'  # Positional encoding type
@@ -58,7 +64,7 @@ torch.cuda.manual_seed(seed)
 torch.backends.cuda.matmul.allow_tf32 = True  # Allow TF32 on matmul
 torch.backends.cudnn.allow_tf32 = True  # Allow TF32 on cuDNN
 device_type = 'cuda' if 'cuda' in device else 'cpu'  # For torch.autocast
-ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
+ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[precision]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 collect_info = False
@@ -107,9 +113,9 @@ for ckpt_path in checkpoint_paths:
         checkpoint = torch.load(ckpt_path, map_location=device)
 
         # Update model arguments if necessary
-        checkpoint['model_args']['precision'] = 'float32'
+        checkpoint['model_args']['precision'] = precision#'float32'
         checkpoint['model_args']['flash'] = flash
-        checkpoint['model_args']['block_size'] = 40000  # Set a large block size to accommodate long inputs
+        checkpoint['model_args']['block_size'] = 70000  # Set a large block size to accommodate long inputs
         checkpoint['model_args']['self_extend'] = True
         checkpoint['model_args']['use_pseudo_flash'] = True
         checkpoint['model_args']['pseudo_flash_chunk_size'] = 4096
@@ -394,8 +400,11 @@ for model_name in results:
         # Add to excel_data
         excel_data.append(res)
 
+# Get the folder name
+folder_name_base = os.path.basename(data_directory)
+
 # Create a DataFrame and save to Excel
-df = pd.DataFrame(excel_data)
-excel_file_name = 'results_summary4k.xlsx'
-df.to_excel(excel_file_name, index=False)
-print(f"\nResults have been saved to '{excel_file_name}'.")
+#df = pd.DataFrame(excel_data)
+#excel_file_name = 'results_summary_' + folder_name_base + '.xlsx'
+#df.to_excel(excel_file_name, index=False)
+#print(f"\nResults have been saved to '{excel_file_name}'.")
