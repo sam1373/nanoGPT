@@ -33,6 +33,7 @@ from model import GPTConfig, GPT
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
+loglevel = 'info'
 out_dir = 'out'
 eval_interval = 2000
 log_interval = 1
@@ -180,7 +181,6 @@ model_args = dict(
     n_head=n_head,
     n_embd=n_embd,
     block_size=block_size,
-    vocab_size=vocab_size,
     dropout=dropout,
     bias=bias,
     pe=pe,
@@ -193,7 +193,6 @@ model_args = dict(
     softmax_log_k=softmax_log_k,
     use_nGPT=use_nGPT,
     base_scale=base_scale,
-    relu_instead_of_attn_softmax=relu_instead_of_attn_softmax,
     topk_after_attn_softmax=topk_after_attn_softmax,
     relu_neg_inf=relu_neg_inf,
     pretraining_seq_length=pretraining_seq_length,
