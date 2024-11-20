@@ -98,15 +98,29 @@ class CausalSelfAttention(nn.Module):
         res = x / x.norm(p=2, dim=-1, keepdim=True)
         return res
 
-    def forward(self, x, pos=None, collect_info=False):
-        B, T, C = x.size()
+    def forward(self, x, pos=None, collect_info=False, kv_cache=None, return_kv_cache=False):
+        B, _, C = x.size()
         device = x.device
 
         qkv = self.c_attn(x)
         q, k, v = qkv.split(self.n_embd, dim=2)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        q = q.view(B, -1, self.n_head, C // self.n_head).transpose(1, 2)
+        k = k.view(B, -1, self.n_head, C // self.n_head).transpose(1, 2)
+        v = v.view(B, -1, self.n_head, C // self.n_head).transpose(1, 2)
+
+        #print("kv_cache", kv_cache)
+
+        if kv_cache is not None:
+            k0, v0 = kv_cache
+            k = torch.cat([k0, k], dim=2)
+            v = torch.cat([v0, v], dim=2)
+            #shape: (B, n_head, T, C // n_head)
+
+            #print("k0 shape:", k0.shape)
+
+        if return_kv_cache:
+            kv_cache = (k, v)
+            #need to do now before rotations
 
 
         if self.training and self.head_dropout > 0:
@@ -145,8 +159,8 @@ class CausalSelfAttention(nn.Module):
             q = sqk * self.justnorm(q)
             k = sqk * self.justnorm(k)
 
-        if pos is None:
-            pos = torch.arange(0, T, dtype=torch.long, device=device)
+        if pos is None or kv_cache is not None:
+            pos = torch.arange(0, k.shape[2], dtype=torch.long, device=device)
 
         #q = q * 1.6
 
@@ -155,24 +169,26 @@ class CausalSelfAttention(nn.Module):
             k = k.to(torch.float16)
             v = v.to(torch.float16)
 
+        #print(q.shape, k.shape)
+
         if self.flash and not self.config.use_pseudo_flash:
 
             y = flash_attn_func(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
                                 dropout_p=self.dropout if self.training else 0, softmax_scale=None, causal=True,
                                 window_size=(-1, -1), alibi_slopes=self.alibi_slopes, deterministic=False)
             weighted_v = y.transpose(1, 2)
-        elif self.config.use_pseudo_flash:
+        elif self.config.use_pseudo_flash and q.shape[2] > self.config.pseudo_flash_chunk_size:
             # Use pseudo-flash attention
             weighted_v, extra_info = self.pseudo_flash_attention(q, k, v, pos, x, collect_info)
         else:
-            if self.config.self_extend and T > self.config.pretraining_seq_length and self.config.pe == 'rope':
+            if self.config.self_extend and k.shape[2] > self.config.pretraining_seq_length and self.config.pe == 'rope':
                 # Compute group size dynamically
                 denominator = max((self.config.pretraining_seq_length - self.config.window_size), 1)
-                g_size = (T - self.config.window_size + denominator - 1) // denominator * 32
+                g_size = (k.shape[2] - self.config.window_size + denominator - 1) // denominator * 32
                 g_size = max(g_size, 1)
 
 
-                logging.info(f"g_size: {g_size}")
+                #logging.info(f"g_size: {g_size}")
 
                 w_size = self.config.window_size
 
@@ -194,8 +210,9 @@ class CausalSelfAttention(nn.Module):
 
                 # Compute normal attention
                 ngb_attn = torch.matmul(ngb_q, ngb_k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-                ngb_attn = ngb_attn.masked_fill(
-                    torch.tril(torch.ones(T, T, device=device)).unsqueeze(0).unsqueeze(0) == 0, float('-inf'))
+                #ngb_attn = ngb_attn.masked_fill(
+                #    torch.tril(torch.ones(T, T, device=device)).unsqueeze(0).unsqueeze(0) == 0, float('-inf'))
+                ngb_attn = self.apply_right_aligned_causal_mask(ngb_attn)
 
                 # Apply positional encodings for grouped attention
                 if self.config.pe == 'rope':
@@ -209,17 +226,29 @@ class CausalSelfAttention(nn.Module):
 
                 # Compute grouped attention
                 g_attn = torch.matmul(g_q, g_k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-                g_attn = g_attn.masked_fill(torch.tril(torch.ones(T, T, device=device)).unsqueeze(0).unsqueeze(0) == 0,
-                                            float('-inf'))
+                #g_attn = g_attn.masked_fill(torch.tril(torch.ones(T, T, device=device)).unsqueeze(0).unsqueeze(0) == 0,
+                #                            float('-inf'))
+                g_attn = self.apply_right_aligned_causal_mask(g_attn)
 
-                # Create masks
+                merge_mask = self._compute_merge_mask_chunk(k.shape[2] - q.shape[2], k.shape[2], w_size, device)
+                #causal_mask = self._compute_causal_mask_chunk(k.shape[2] - q.shape[2], k.shape[2], device)
+
+                #print(merge_mask)
+                #print(merge_mask.sum(dim=-1))
+                #print(merge_mask.shape)
+
+
+                attn = torch.where(merge_mask.unsqueeze(0).unsqueeze(0), ngb_attn, g_attn)
+                #attn = attn.masked_fill(~causal_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+
+                """# Create masks
                 g_mask = torch.tril(torch.ones(T - w_size, T - w_size, device=device))
                 mask = torch.ones(T, T, device=device)
                 mask[w_size:, :-w_size] -= g_mask
 
                 # Merge attention scores
                 mask = mask.bool()
-                attn = torch.where(mask.unsqueeze(0).unsqueeze(0), ngb_attn, g_attn)
+                attn = torch.where(mask.unsqueeze(0).unsqueeze(0), ngb_attn, g_attn)"""
             else:
                 if self.config.pe == 'rope':
                     angles = self.rotary_pos_emb(pos)
@@ -229,7 +258,14 @@ class CausalSelfAttention(nn.Module):
                     pass
 
                 attn = torch.matmul(q, k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-                attn = attn.masked_fill(torch.tril(torch.ones(T, T, device=device)).unsqueeze(0).unsqueeze(0) == 0, float('-inf'))
+
+                """T_q = q.shape[2]
+                T_k = k.shape[2]
+                i = torch.arange(T_q, device=device).unsqueeze(-1)  # Shape: (T_q, 1)
+                j = torch.arange(T_k, device=device).unsqueeze(0)  # Shape: (1, T_k)
+                causal_mask = i + (T_k - T_q) >= j  # Shape: (T_q, T_k)
+                attn = attn.masked_fill(causal_mask == 0, float('-inf'))"""
+                attn = self.apply_right_aligned_causal_mask(attn)
 
             if self.training and self.local_heads_during_training > 0:
                 if self.local_heads_random:
@@ -339,14 +375,45 @@ class CausalSelfAttention(nn.Module):
                 weighted_v = torch.matmul(attn_probs, v)
                 extra_info = None
 
-        y = weighted_v.transpose(1, 2).contiguous().view(B, T, C)
+        y = weighted_v.transpose(1, 2).contiguous().view(B, -1, C)
 
         y = self.resid_dropout(self.c_proj(y))
 
         if collect_info:
             return y, extra_info
         else:
+            if return_kv_cache:
+                #k shape: (B, n_head, T, C // n_head)
+                return y, kv_cache
             return y
+
+    def apply_right_aligned_causal_mask(self, attn_scores):
+        """
+        Apply a right-aligned causal mask to the given attention scores.
+
+        Args:
+            attn_scores (torch.Tensor): Attention scores of shape (B, n_head, T_q, T_k),
+                                 where T_q is the length of queries and T_k is the length of keys.
+
+        Returns:
+            torch.Tensor: Masked attention scores.
+        """
+        # Get the sizes of T_q (queries) and T_k (keys)
+        T_q = attn_scores.size(-2)
+        T_k = attn_scores.size(-1)
+        device = attn_scores.device
+
+        # Generate indices for T_q and T_k
+        i = torch.arange(T_q, device=device).unsqueeze(-1)  # Shape: (T_q, 1)
+        j = torch.arange(T_k, device=device).unsqueeze(0)  # Shape: (1, T_k)
+
+        # Create the right-aligned causal mask
+        causal_mask = (i + (T_k - T_q)) >= j  # Shape: (T_q, T_k)
+
+        # Apply the mask to the attention scores
+        attn_scores = attn_scores.masked_fill(~causal_mask, float('-inf'))
+
+        return attn_scores
 
     def pseudo_flash_attention(self, q, k, v, pos, x, collect_info):
         """
@@ -387,7 +454,7 @@ class CausalSelfAttention(nn.Module):
             # Compute shifted grouped positions
             s_g_pos = g_pos + shift
 
-            for t_start in range(0, T, chunk_size):
+            for t_start in tqdm(range(0, T, chunk_size)):
                 t_end = min(t_start + chunk_size, T)
                 t_chunk = t_end - t_start
                 q_chunk = q[:, :, t_start:t_end, :]
@@ -425,7 +492,7 @@ class CausalSelfAttention(nn.Module):
                             1.0 / math.sqrt(head_dim))
 
                     # Compute the merge mask chunk
-                    mask_chunk = self._compute_merge_mask_chunk(t_start, t_end, T, w_size, device)
+                    mask_chunk = self._compute_merge_mask_chunk(t_start, t_end, w_size, device)
 
                     # Merge attention scores using the mask chunk
                     attn_scores_chunk = torch.where(mask_chunk.unsqueeze(0).unsqueeze(0),
@@ -641,21 +708,21 @@ class CausalSelfAttention(nn.Module):
 
         return weighted_v, extra_info
 
-    def _compute_merge_mask_chunk(self, t_start, t_end, T, w_size, device):
+    def _compute_merge_mask_chunk(self, t_start, t_end, w_size, device):
         """
         Computes the merge mask for a specific chunk without keeping the entire mask in memory.
         """
-        t_chunk = t_end - t_start
+        #t_chunk = t_end - t_start
         i = torch.arange(t_start, t_end, device=device).unsqueeze(1)  # Shape: [t_chunk, 1]
         j = torch.arange(t_end, device=device).unsqueeze(0)  # Shape: [1, t_end]
 
         # Conditions based on the original mask logic
         cond1 = i >= w_size
-        cond2 = j < T - w_size
-        cond3 = (i - w_size) >= j
+        #cond2 = j < T - w_size
+        cond2 = (i - w_size) >= j
 
         # Compute the mask chunk
-        mask_chunk = ~(cond1 & cond2 & cond3)
+        mask_chunk = ~(cond1 & cond2)
         return mask_chunk
 
     def _compute_causal_mask_chunk(self, t_start, t_end, device):
@@ -885,7 +952,7 @@ class Block(nn.Module):
         res = x / x.norm(p=2, dim=-1, keepdim=True)
         return res
 
-    def forward(self, x, pos=None, collect_info=False):
+    def forward(self, x, pos=None, collect_info=False, kv_cache=None, return_kv_cache=False):
         if collect_info:
             ln1_out = self.ln_1(x)
             attn_out, attn_info = self.attn(ln1_out, pos=pos, collect_info=collect_info)
@@ -917,7 +984,9 @@ class Block(nn.Module):
             return x, attn_info
         else:
             ln1_out = self.ln_1(x)
-            attn_out = self.attn(ln1_out, pos=pos)
+            attn_out = self.attn(ln1_out, pos=pos, kv_cache=kv_cache, return_kv_cache=return_kv_cache)
+            if return_kv_cache:
+                attn_out, kv_cache = attn_out
             if self.config.use_nGPT == 1:
                 lr = self.attn_alpha * (self.attn_alpha_init_value / self.attn_alpha_init_scaling)
                 lr = torch.abs(lr)
@@ -943,6 +1012,9 @@ class Block(nn.Module):
                 x = self.justnorm(res)
             else:
                 x = x + mlp_out
+
+            if return_kv_cache:
+                return x, kv_cache
             return x
 
 class GPT(nn.Module):
@@ -1018,11 +1090,16 @@ class GPT(nn.Module):
             else:
                 torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None, collect_info=False, collect_probs_per_layer=False):
+    def forward(self, idx, targets=None, collect_info=False, collect_probs_per_layer=False, kv_cache=None, return_kv_cache=False):
         device = idx.device
         b, t = idx.size()
-        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device)  # Shape: (t)
+        s = 0
+        if kv_cache is not None:
+            s = kv_cache[0][0].shape[2]
+            t += s
+            #in case we need correct abs position for decoding, I guess
+        #assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        pos = torch.arange(s, t, dtype=torch.long, device=device)  # Shape: (t)
 
         # Forward the GPT model itself
         tok_emb = self.transformer.wte(idx)  # Shape: (b, t, n_embd)
@@ -1035,12 +1112,26 @@ class GPT(nn.Module):
         attn_info_per_layer = [] if collect_info else None
         logits_per_layer = [] if collect_probs_per_layer else None
 
+        # create layer-wise kv_cache
+        if kv_cache is None:
+            kv_cache_per_layer = [None] * self.config.n_layer
+        else:
+            kv_cache_per_layer = kv_cache
+
+        #print(len(kv_cache_per_layer))
+        #print(kv_cache)
+        #print(return_kv_cache)
+
         for layer_idx, block in enumerate(self.transformer.h):
             if collect_info:
                 x, attn_info = block(x, pos=pos, collect_info=collect_info)
                 attn_info_per_layer.append(attn_info)
             else:
-                x = block(x, pos=pos)
+                x = block(x, pos=pos, kv_cache=kv_cache_per_layer[layer_idx], return_kv_cache=return_kv_cache)
+                if return_kv_cache:
+                    x, kv_cache_per_layer[layer_idx] = x
+
+                    #print(x, kv_cache_per_layer[layer_idx])
 
             if collect_probs_per_layer:
                 x0 = self.transformer.ln_f(x)
@@ -1065,14 +1156,18 @@ class GPT(nn.Module):
                 logits = sz * logits
             loss = None
 
-        if collect_info and collect_probs_per_layer:
+        """if collect_info and collect_probs_per_layer:
             return logits, loss, attn_info_per_layer, logits_per_layer, x
         elif collect_info:
             return logits, loss, attn_info_per_layer, x
         elif collect_probs_per_layer:
             return logits, loss, logits_per_layer
-        else:
-            return logits, loss
+        else:"""
+
+        if return_kv_cache:
+            return logits, kv_cache_per_layer
+
+        return logits, loss
 
     def crop_block_size(self, block_size):
         # Model surgery to decrease the block size if necessary
@@ -1222,6 +1317,7 @@ class GPT(nn.Module):
         initial_context_length = seq_len  # The length of the initial context
 
         # Collect info for initial context
+        """
         if collect_info or collect_probs_per_layer:
             outputs = self(idx_cond, collect_info=collect_info, collect_probs_per_layer=collect_probs_per_layer)
             if collect_info and collect_probs_per_layer:
@@ -1244,16 +1340,6 @@ class GPT(nn.Module):
                 decoded_token = decode([token_id]) if decode else None
                 decoded_tokens.append(decoded_token)
 
-            # Normalize embeddings
-            # hidden_states shape: (1, t, n_embd)
-            """hidden_states_norm = hidden_states[0] / hidden_states[0].norm(dim=-1, keepdim=True)  # Shape: (t, n_embd)
-            embedding_weight_norm = self.lm_head.weight / self.lm_head.weight.norm(dim=-1,
-                                                                                   keepdim=True)  # Shape: (vocab_size, n_embd)
-            # Compute cosine similarities
-            cos_similarities = torch.matmul(hidden_states_norm, embedding_weight_norm.T)  # Shape: (t, vocab_size)
-            # For each token, get top 10 most similar tokens
-            top_k_similar = 10
-            topk_sim_values, topk_sim_indices = torch.topk(cos_similarities, k=top_k_similar, dim=-1)  # Shape: (t, k)"""
 
             # Initialize token_norms
             token_norms = [{'q_norms': [], 'k_norms': [], 'v_norms': []} for _ in range(seq_len)]
@@ -1284,14 +1370,6 @@ class GPT(nn.Module):
                     'most_similar_tokens': [],
                     'next_token_probs_per_layer': [],  # Initialize per-layer next token probabilities
                 }
-                """# Get most similar tokens
-                sim_token_ids = topk_sim_indices[i].tolist()
-                sim_token_sims = topk_sim_values[i].tolist()
-                # Decode similar tokens individually
-                sim_decoded_tokens = []
-                for sim_tid in sim_token_ids:
-                    sim_decoded_token = decode([sim_tid]) if decode else None
-                    sim_decoded_tokens.append(sim_decoded_token)"""
 
                 #most_similar_tokens = [
                 #    {'token_id': tid, 'decoded_token': dtok, 'similarity': sim}
@@ -1364,13 +1442,19 @@ class GPT(nn.Module):
                     })
                 next_token_probs_per_layer.append(next_token_probs_layer)
             token_info['next_token_probs_per_layer'] = next_token_probs_per_layer
-
+"""
         next_token_probs_list = []
+
+        kv_cache = None
+
+        idx_cond = idx
+
+        use_kv_cache = True
 
         # Start generating new tokens
         for t in tqdm(range(max_new_tokens), desc="Generating tokens"):
-            idx_cond = idx[:, -self.config.block_size:] if idx.size(1) > self.config.block_size else idx
-            if collect_info or collect_probs_per_layer:
+            #[:, -self.config.block_size:] if idx.size(1) > self.config.block_size else idx
+            """if collect_info or collect_probs_per_layer:
                 outputs = self(idx_cond, collect_info=collect_info, collect_probs_per_layer=collect_probs_per_layer)
                 if collect_info and collect_probs_per_layer:
                     logits, _, attn_info_per_layer, logits_per_layer, hidden_states = outputs
@@ -1378,11 +1462,17 @@ class GPT(nn.Module):
                     logits, _, attn_info_per_layer, hidden_states = outputs
                 elif collect_probs_per_layer:
                     logits, _, logits_per_layer = outputs
+            else:"""
+
+            #kv_cache = None
+
+            if use_kv_cache:
+                logits, kv_cache = self(idx_cond, kv_cache=kv_cache, return_kv_cache=True)
             else:
                 logits, _ = self(idx_cond)
 
-            if collect_probs_per_layer:
-                logits_per_layer_generated.extend(logits_per_layer)
+            #if collect_probs_per_layer:
+            #    logits_per_layer_generated.extend(logits_per_layer)
 
             logits = logits[:, -1, :] / temperature  # Shape: (1, vocab_size)
 
@@ -1406,7 +1496,6 @@ class GPT(nn.Module):
                             'probability': probability
                         })
                     next_token_probs_per_layer.append(next_token_probs_layer)
-
 
             probs = F.softmax(logits, dim=-1)  # Shape: (1, vocab_size)
 
@@ -1439,13 +1528,22 @@ class GPT(nn.Module):
 
             probs = F.softmax(logits, dim=-1)  # Shape: (1, vocab_size)
 
+            #token_id = idx[:, -1].item()
+            #if we are looking at token before generated instead
+
             # Sample the next token
             idx_next = torch.multinomial(probs, num_samples=1)  # Shape: (1, 1)
-            idx = torch.cat((idx, idx_next), dim=1)  # Append to sequence
 
-            token_id = idx[:, -2].item()
-            # -2 because we are updating information for the token before the last generated one
+            idx = torch.cat((idx, idx_next), dim=1)
+
+            if use_kv_cache:
+                idx_cond = idx_next#only need last token for decoding with kv_cache
+            else:
+                idx_cond = idx#torch.cat((idx_cond, idx_next), dim=1)
+
+            token_id = idx_next.item()
             decoded_token = decode([token_id]) if decode else None
+
 
             if collect_info:
                 token_info = {

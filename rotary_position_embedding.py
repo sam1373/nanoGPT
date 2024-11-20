@@ -33,6 +33,12 @@ def apply_rotary_pos_emb(t, angles):
         rotary positional embeding tensor freqs is of shape [seq_length, ..., dim]
         check https://kexue.fm/archives/8265 for detailed formulas
         """
+
+        #assume right-aligned
+        if angles.shape[0] != t.shape[2]:
+            #print(f"angles shape {angles.shape} is not equal to t shape {t.shape}")
+            angles = angles[-t.shape[2]:]
+
         rot_dim = angles.shape[-1]
         # if t_pass is empty so rotary pos embedding is applied to all tensor t
         t, t_pass = t[..., :rot_dim], t[..., rot_dim:]
