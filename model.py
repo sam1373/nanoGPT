@@ -16,6 +16,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 from rotary_position_embedding import RotaryEmbedding, apply_rotary_pos_emb
+from train import dtype
 from xpos2_position_embedding import Xpos2Embedding, apply_xpos2_emb
 from alibi_relative_position_embedding import build_slopes
 try:
@@ -166,9 +167,9 @@ class CausalSelfAttention(nn.Module):
             q = q * self.config.q_constant_scale
 
         if self.flash:
-            q = q.to(torch.float16)
-            k = k.to(torch.float16)
-            v = v.to(torch.float16)
+            q = q.to(torch.bfloat16)
+            k = k.to(torch.bfloat16)
+            v = v.to(torch.bfloat16)
 
         #print(q.shape, k.shape)
 
@@ -846,16 +847,16 @@ class MLP(nn.Module):
         super().__init__()
         self.config = config
         if config.use_nGPT == 1:
-            self.c_fc = nn.Linear(config.n_embd, 2 * 4 * config.n_embd, bias=config.bias)
+            self.c_fc = nn.Linear(config.n_embd, 2 * 4 * config.n_embd, bias=config.bias, dtype=self.config.dtype)
             self.silu = nn.SiLU()
-            self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+            self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias, dtype=self.config.dtype)
             self.suv_init_value = 1.0
             self.suv_init_scaling = 1.0
             self.suv = nn.Parameter(self.suv_init_scaling * torch.ones(2 * 4 * config.n_embd, dtype=torch.float32))
         else:
-            self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+            self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias, dtype=self.config.dtype)
             self.gelu    = nn.GELU()
-            self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+            self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias, dtype=self.config.dtype)
             self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
@@ -945,11 +946,11 @@ class Block(nn.Module):
         if config.use_nGPT == 1:
             self.attn_alpha_init_value = 0.05
             self.attn_alpha_init_scaling = config.base_scale
-            self.attn_alpha = nn.Parameter(self.attn_alpha_init_scaling * torch.ones(config.n_embd, dtype=self.config.dtype))
+            self.attn_alpha = nn.Parameter(self.attn_alpha_init_scaling * torch.ones(config.n_embd, dtype=torch.float32))
 
             self.mlp_alpha_init_value = 0.05
             self.mlp_alpha_init_scaling = config.base_scale
-            self.mlp_alpha = nn.Parameter(self.mlp_alpha_init_scaling * torch.ones(config.n_embd, dtype=self.config.dtype))
+            self.mlp_alpha = nn.Parameter(self.mlp_alpha_init_scaling * torch.ones(config.n_embd, dtype=torch.float32))
 
     def justnorm(self, x):
         res = x / x.norm(p=2, dim=-1, keepdim=True)
@@ -1062,7 +1063,7 @@ class GPT(nn.Module):
         if config.use_nGPT == 1:
             self.sz_init_value = 1.00
             self.sz_init_scaling = config.base_scale
-            self.sz = nn.Parameter(self.sz_init_scaling * torch.ones(config.vocab_size, dtype=self.config.dtype))
+            self.sz = nn.Parameter(self.sz_init_scaling * torch.ones(config.vocab_size, dtype=torch.float32))
 
         # Report number of parameters
         logging.info("Number of parameters: %.2fM" % (self.get_num_params() / 1e6,))
