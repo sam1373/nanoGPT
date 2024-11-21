@@ -16,7 +16,6 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 from rotary_position_embedding import RotaryEmbedding, apply_rotary_pos_emb
-from train import dtype
 from xpos2_position_embedding import Xpos2Embedding, apply_xpos2_emb
 from alibi_relative_position_embedding import build_slopes
 try:
@@ -297,43 +296,9 @@ class CausalSelfAttention(nn.Module):
                 attn = F.silu(attn)
                 attn = attn.masked_fill(torch.tril(torch.ones(T, T, device=device)).unsqueeze(0).unsqueeze(0) == 0, float('-inf'))
 
-            attn_probs = F.softmax(attn, dim=-1)
+            attn_probs = self.softmax_like(attn, k.shape[2])
 
-            if self.config.topk_after_attn_softmax > 0:
-                top_n_values, top_n_indices = torch.topk(attn_probs, self.config.topk_after_attn_softmax, dim=-1)
-                mask = torch.zeros_like(attn_probs)
-                mask.scatter_(-1, top_n_indices, 1.0)
-                attn_probs = attn_probs * mask
-                attn_probs_sum = attn_probs.sum(dim=-1, keepdim=True) + 1e-8
-                attn_probs = attn_probs / attn_probs_sum
-
-            if self.config.top_p > 0:
-                sorted_probs, sorted_indices = torch.sort(attn_probs, descending=True, dim=-1)
-                cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-                cumulative_mask = cumulative_probs <= self.config.top_p
-                cumulative_mask[..., 0] = True
-                sorted_probs = sorted_probs * cumulative_mask
-                sorted_probs_sum = sorted_probs.sum(dim=-1, keepdim=True) + 1e-8
-                sorted_probs = sorted_probs / sorted_probs_sum
-                attn_probs = torch.zeros_like(attn_probs).scatter_(-1, sorted_indices, sorted_probs)
-
-            if self.config.min_p > 0:
-                max_probs, _ = torch.max(attn_probs, dim=-1, keepdim=True)
-                min_threshold = max_probs * self.config.min_p
-                min_p_mask = attn_probs >= min_threshold
-                attn_probs = attn_probs * min_p_mask
-                attn_probs_sum = attn_probs.sum(dim=-1, keepdim=True) + 1e-8
-                attn_probs = attn_probs / attn_probs_sum
-
-            if self.config.top_a > 0:
-                max_probs, _ = torch.max(attn_probs, dim=-1, keepdim=True)
-                threshold = (max_probs ** 2) * self.config.top_a
-                top_a_mask = attn_probs >= threshold
-                attn_probs = attn_probs * top_a_mask
-                attn_probs_sum = attn_probs.sum(dim=-1, keepdim=True) + 1e-8
-                attn_probs = attn_probs / attn_probs_sum
-
-
+            attn_probs = self._apply_probability_modifications(attn_probs)
 
             attn_probs = self.attn_dropout(attn_probs)
 
@@ -440,7 +405,7 @@ class CausalSelfAttention(nn.Module):
             topk_indices_from_list = []
 
         # Check if self_extend is enabled
-        if self.config.self_extend and T > self.config.pretraining_seq_length and self.config.pe == 'rope':
+        if self.config.self_extend and q.shape[2] > self.config.pretraining_seq_length and self.config.pe == 'rope':
             # Assume self_extend is only used in inference
             # Compute group size dynamically
             denominator = max((self.config.pretraining_seq_length - self.config.window_size), 1)
@@ -657,7 +622,12 @@ class CausalSelfAttention(nn.Module):
                 attn_scores_chunk = self._apply_additional_configs_training(attn_scores_chunk, t_start, t_end)
 
                 # Compute attention probabilities
-                attn_probs_chunk = F.softmax(attn_scores_chunk, dim=-1)
+                #if self.config.sigmoid_attn:
+                #    attn_probs_chunk = torch.sigmoid(attn_scores_chunk - torch.log(1e-8 + T))
+                #else:
+
+                attn_probs_chunk = self.softmax_like(attn_scores_chunk, T)
+                #F.softmax(attn_scores_chunk, dim=-1)
 
                 # Apply probability modifications (top-k, top-p, etc.)
                 attn_probs_chunk = self._apply_probability_modifications(attn_probs_chunk)
@@ -709,6 +679,31 @@ class CausalSelfAttention(nn.Module):
             extra_info = None
 
         return weighted_v, extra_info
+
+    def softmax_like(self, scores, T):
+
+        if self.config.softmax_like == 'sigmoid':
+            return F.sigmoid(scores - torch.log(torch.tensor(T, device=scores.device)))
+        elif self.config.softmax_like == 'sparsemax':
+            sorted_input, _ = torch.sort(scores, descending=True, dim=-1)
+            cumsum_sorted = torch.cumsum(sorted_input, dim=-1)
+            num_classes = scores.size(-1)
+            range_tensor = torch.arange(1, num_classes + 1, device=scores.device, dtype=scores.dtype)
+            threshold = (cumsum_sorted - 1) / range_tensor
+            is_valid = sorted_input > threshold
+            k = is_valid.sum(dim=-1, keepdim=True)
+
+            tau = (cumsum_sorted.gather(dim=-1, index=k - 1) - 1).squeeze(-1) / k.squeeze(-1)
+            tau = tau.unsqueeze(-1)
+            output = torch.clamp(scores - tau, min=0)
+            return output
+        elif self.config.softmax_like == 'simple_thr_clamp':
+            thr, _ = scores.max(dim = -1)
+            thr *= 0.2
+            scores = torch.clamp(scores - thr.unsqueeze(-1), min=0)
+            return scores
+        else:
+            return F.softmax(scores, dim=-1)
 
     def _compute_merge_mask_chunk(self, t_start, t_end, w_size, device):
         """
@@ -925,6 +920,8 @@ class GPTConfig:
     pseudo_flash_chunk_size: int = 1024
 
     q_constant_scale: float = 1.0
+
+    softmax_like: str = "softmax"
 
     def __post_init__(self):
         if self.base_scale is None:
