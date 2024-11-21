@@ -762,6 +762,7 @@ class CausalSelfAttention(nn.Module):
 
         # Apply local heads during training if configured
         if self.training and self.local_heads_during_training > 0:
+            T = k.shape[2]
             if self.local_heads_random:
                 head_indices = torch.randperm(self.n_head)[:self.local_heads_during_training]
             else:
