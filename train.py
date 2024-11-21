@@ -32,7 +32,6 @@ from datetime import timedelta
 
 import logging
 
-from softmax_like_test import softmax
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -106,7 +105,8 @@ min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchi
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
-device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
+device = 'cuda'
+# examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 #dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
 
@@ -383,55 +383,10 @@ if master_process:
     print("score_threshold: %f" % (score_threshold))
     print("score_scale: %f" % (score_scale))
     print("q_constant_scale: %f" % (q_constant_scale))
+    print("softmax_like: %s" % (softmax_like))
     print("precision: %s" % (precision))
     print("batch_size: %f" % (batch_size))
 
-
-
-def get_hparams_str(model):
-    if (use_nGPT == 0):
-        return ""
-    if isinstance(model, torch.nn.parallel.DistributedDataParallel):
-        transformer = model.module.transformer
-        config = model.module.config
-        module = model.module
-    else:
-        transformer = model.transformer
-        config = model.config
-        module = model
-
-    resstr = "%.5f " % torch.mean(module.sz * (module.sz_init_value / module.sz_init_scaling))
-
-    for layer_idx in range(0, config.n_layer):
-        block = transformer["h"][layer_idx]
-        sqk = block.sqk * (block.sqk_init_value / block.sqk_init_scaling)
-        attn_alpha = block.attn_alpha * (block.attn_alpha_init_value / block.attn_alpha_init_scaling)
-        mlp_alpha = block.mlp_alpha * (block.mlp_alpha_init_value / block.mlp_alpha_init_scaling)
-        suv = block.suv * (block.suv_init_value / block.suv_init_scaling)
-
-        resstr = resstr + "%.5f " % torch.mean(sqk)
-        resstr = resstr + "%.5f " % torch.mean(attn_alpha)
-        resstr = resstr + "%.5f " % torch.mean(mlp_alpha)
-        resstr = resstr + "%.5f " % torch.mean(suv)
-
-    return resstr
-
-
-stat_fname = out_dir + "/stat"
-if master_process:
-    if init_from == 'scratch':
-        file = open(stat_fname, "w")
-        resstr = f"{0:.6e} {0:.4e} {0.0:.4e} {0.0:.4e} {0.0:.4e} {0.0:.4e} {0.0:.4e} {0.0:.4e} {0.0:.4e} {0.0:.4e} {0.0:.4e} {0:.4e} {0.0:.4e}"
-        resstr = resstr + get_hparams_str(model) + "\n"
-        file.write(resstr)
-        arguments = sys.argv
-        fname_arg = out_dir + "/args"
-        with open(fname_arg, 'w') as file_arg:
-            for arg in arguments:
-                file_arg.write(arg + '\n')
-
-    if init_from == 'resume':
-        file = open(stat_fname, "a")
 
 time_spent = time.time() - tlaunch
 print(f"Time spent: {time_spent} seconds")
@@ -462,13 +417,13 @@ def normalize_matrices():
     for layer_idx in range(0, config.n_layer):
         block = transformer["h"][layer_idx]
 
-        block.query.weight.data.copy_(justnorm(block.query.weight.data, 1))  # n_proj, n_embd
-        block.key.weight.data.copy_(justnorm(block.key.weight.data, 1))  # n_proj, n_embd
-        block.value.weight.data.copy_(justnorm(block.value.weight.data, 1))  # n_proj, n_embd
-        block.att_c_proj.weight.data.copy_(justnorm(block.att_c_proj.weight.data, 0))  # n_embd, n_proj
+        block.attn.c_attn.weight.data.copy_(justnorm(block.attn.c_attn.weight.data, 1))  # n_proj, n_embd
+        #block.key.weight.data.copy_(justnorm(block.key.weight.data, 1))  # n_proj, n_embd
+        #block.value.weight.data.copy_(justnorm(block.value.weight.data, 1))  # n_proj, n_embd
+        block.attn.c_proj.weight.data.copy_(justnorm(block.attn.c_proj.weight.data, 0))  # n_embd, n_proj
 
-        block.c_fc.weight.data.copy_(justnorm(block.c_fc.weight.data, 1))  # n_proj, n_embd
-        block.mlp_c_proj.weight.data.copy_(justnorm(block.mlp_c_proj.weight.data, 0))  # n_embd, n_proj
+        block.mlp.c_fc.weight.data.copy_(justnorm(block.mlp.c_fc.weight.data, 1))  # n_proj, n_embd
+        block.mlp.c_proj.weight.data.copy_(justnorm(block.mlp.c_proj.weight.data, 0))  # n_embd, n_proj
 
 
 if (use_nGPT == 1):
@@ -564,11 +519,6 @@ while True:
         print("lr=%f" % lr)
 
     if master_process:
-        resstr = f"{iter_num:.6e} {lr:.4e} {losses['train']:.4e} {losses['val']:.4e} {0.0:.4e} {0.0:.4e} {0.0:.4e} {0.0:.4e} {0.0:.4e} {0.0:.4e} {0.0:.4e} {0:.4e} {0.0:.4e} "
-        resstr = resstr + get_hparams_str(model) + "\n"
-
-        file.write(resstr)
-        file.flush()
 
         if iter_num >= max_iters:
             finished_fname = out_dir + "/finished"
