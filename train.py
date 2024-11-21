@@ -82,6 +82,7 @@ top_a = 0.0
 silu_before_attn_softmax = False
 score_threshold = 0.0
 score_scale = 1.0
+q_constant_scale = 1.0
 
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
@@ -208,6 +209,7 @@ model_args = dict(
     silu_before_attn_softmax=silu_before_attn_softmax,
     score_threshold=score_threshold,
     score_scale=score_scale,
+    q_constant_scale=q_constant_scale,
 )
 if init_from == 'scratch':
     # init a new model from scratch

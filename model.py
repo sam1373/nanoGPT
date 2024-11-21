@@ -162,7 +162,8 @@ class CausalSelfAttention(nn.Module):
         if pos is None or kv_cache is not None:
             pos = torch.arange(0, k.shape[2], dtype=torch.long, device=device)
 
-        #q = q * 1.6
+        if self.config.q_constant_scale != 1.0:
+            q = q * self.config.q_constant_scale
 
         if self.flash:
             q = q.to(torch.float16)
@@ -921,6 +922,8 @@ class GPTConfig:
 
     use_pseudo_flash: bool = False
     pseudo_flash_chunk_size: int = 1024
+
+    q_constant_scale: float = 1.0
 
     def __post_init__(self):
         if self.base_scale is None:
