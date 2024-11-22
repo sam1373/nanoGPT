@@ -62,6 +62,12 @@ class CausalSelfAttention(nn.Module):
         self.score_threshold = config.score_threshold
         self.score_scale = config.score_scale
 
+        sqrt_head_dim = (self.config.n_embd / self.config.n_head) ** 0.5
+        if (self.config.use_nGPT == 0):
+            self.softmax_scale = 1.0 / sqrt_head_dim
+        if (self.config.use_nGPT == 1):
+            self.softmax_scale = sqrt_head_dim
+
         self.alibi_slopes = None
         head_size = self.n_embd // self.n_head
 
@@ -175,7 +181,7 @@ class CausalSelfAttention(nn.Module):
         if self.flash and not self.config.use_pseudo_flash:
 
             y = flash_attn_func(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
-                                dropout_p=self.dropout if self.training else 0, softmax_scale=None, causal=True,
+                                dropout_p=self.dropout if self.training else 0, softmax_scale=self.softmax_scale, causal=True,
                                 window_size=(-1, -1), alibi_slopes=self.alibi_slopes, deterministic=False)
             weighted_v = y.transpose(1, 2)
         elif self.config.use_pseudo_flash and q.shape[2] > self.config.pseudo_flash_chunk_size:
@@ -210,7 +216,8 @@ class CausalSelfAttention(nn.Module):
                     pass
 
                 # Compute normal attention
-                ngb_attn = torch.matmul(ngb_q, ngb_k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+                ngb_attn = torch.matmul(ngb_q, ngb_k.transpose(-2, -1)) * self.softmax_scale
+                # * (1.0 / math.sqrt(k.size(-1)))
                 #ngb_attn = ngb_attn.masked_fill(
                 #    torch.tril(torch.ones(T, T, device=device)).unsqueeze(0).unsqueeze(0) == 0, float('-inf'))
                 ngb_attn = self.apply_right_aligned_causal_mask(ngb_attn)
@@ -226,7 +233,7 @@ class CausalSelfAttention(nn.Module):
                     pass
 
                 # Compute grouped attention
-                g_attn = torch.matmul(g_q, g_k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+                g_attn = torch.matmul(g_q, g_k.transpose(-2, -1)) * self.softmax_scale# * (1.0 / math.sqrt(k.size(-1)))
                 #g_attn = g_attn.masked_fill(torch.tril(torch.ones(T, T, device=device)).unsqueeze(0).unsqueeze(0) == 0,
                 #                            float('-inf'))
                 g_attn = self.apply_right_aligned_causal_mask(g_attn)
@@ -258,7 +265,7 @@ class CausalSelfAttention(nn.Module):
                 elif self.config.pe == 'xpos2':
                     pass
 
-                attn = torch.matmul(q, k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+                attn = torch.matmul(q, k.transpose(-2, -1)) * self.softmax_scale
 
                 """T_q = q.shape[2]
                 T_k = k.shape[2]
@@ -297,7 +304,8 @@ class CausalSelfAttention(nn.Module):
                 attn = F.silu(attn)
                 attn = attn.masked_fill(torch.tril(torch.ones(T, T, device=device)).unsqueeze(0).unsqueeze(0) == 0, float('-inf'))
 
-            attn_probs = self.softmax_like(attn, k.shape[2])
+            attn_probs = self.softmax_like(attn, k.shape[2] - q.shape[2])
+            #right-alignment
 
             attn_probs = self._apply_probability_modifications(attn_probs)
 
@@ -443,8 +451,9 @@ class CausalSelfAttention(nn.Module):
                         # Implement xpos2 positional encodings if needed
                         pass
 
-                    attn_scores_chunk_ngb = torch.matmul(q_chunk_ngb, k_chunk_ngb.transpose(-2, -1)) * (
-                            1.0 / math.sqrt(head_dim))
+                    attn_scores_chunk_ngb = torch.matmul(q_chunk_ngb, k_chunk_ngb.transpose(-2, -1)) * self.softmax_scale
+                    # * (
+                    #        1.0 / math.sqrt(head_dim))
 
                     # Compute grouped attention scores (g_attn)
                     if self.config.pe == 'rope':
@@ -456,8 +465,9 @@ class CausalSelfAttention(nn.Module):
                         # Implement xpos2 positional encodings if needed
                         pass
 
-                    attn_scores_chunk_grp = torch.matmul(q_chunk_grp, k_chunk_grp.transpose(-2, -1)) * (
-                            1.0 / math.sqrt(head_dim))
+                    attn_scores_chunk_grp = torch.matmul(q_chunk_grp, k_chunk_grp.transpose(-2, -1)) * self.softmax_scale
+                    # * (
+                    #        1.0 / math.sqrt(head_dim))
 
                     # Compute the merge mask chunk
                     mask_chunk = self._compute_merge_mask_chunk(t_start, t_end, w_size, device)
@@ -478,7 +488,7 @@ class CausalSelfAttention(nn.Module):
                     attn_scores_chunk = self._apply_additional_configs_inference(attn_scores_chunk)
 
                     # Compute attention probabilities
-                    attn_probs_chunk = F.softmax(attn_scores_chunk, dim=-1)
+                    attn_probs_chunk = self.softmax_like(attn_scores_chunk, t_start)
 
                     # Apply probability modifications (top-k, top-p, etc.)
                     attn_probs_chunk = self._apply_probability_modifications(attn_probs_chunk)
@@ -612,7 +622,7 @@ class CausalSelfAttention(nn.Module):
                     pass
 
                 # Compute attention scores
-                attn_scores_chunk = torch.matmul(q_chunk, k_chunk.transpose(-2, -1)) * (1.0 / math.sqrt(head_dim))
+                attn_scores_chunk = torch.matmul(q_chunk, k_chunk.transpose(-2, -1)) * self.softmax_scale# * (1.0 / math.sqrt(head_dim))
 
                 # Apply causal mask
                 causal_mask = torch.tril(torch.ones(t_end, t_end, device=device)).unsqueeze(0).unsqueeze(0)
@@ -627,7 +637,7 @@ class CausalSelfAttention(nn.Module):
                 #    attn_probs_chunk = torch.sigmoid(attn_scores_chunk - torch.log(1e-8 + T))
                 #else:
 
-                attn_probs_chunk = self.softmax_like(attn_scores_chunk, T)
+                attn_probs_chunk = self.softmax_like(attn_scores_chunk, t_start)
                 #F.softmax(attn_scores_chunk, dim=-1)
 
                 # Apply probability modifications (top-k, top-p, etc.)
@@ -681,10 +691,23 @@ class CausalSelfAttention(nn.Module):
 
         return weighted_v, extra_info
 
-    def softmax_like(self, scores, T):
+    def softmax_like(self, scores, t_start=0):
 
-        if self.config.softmax_like == 'sigmoid':
-            return F.sigmoid(scores - torch.log(torch.tensor(T, device=scores.device)))
+        if self.config.softmax_like == 'sigmoid_bias':
+            bias = torch.arange(t_start + 1, t_start + scores.size(-2) + 1, device=scores.device)
+            return F.sigmoid(scores - torch.log(bias.unsqueeze(0)))
+        elif self.config.softmax_like == 'relu_scaled':
+            scores = F.relu(scores)
+            scale = torch.arange(t_start + 1, t_start + scores.size(-2) + 1, device=scores.device)
+            return scores / scale.unsqueeze(0)
+        elif self.config.softmax_like == 'relu_sq_scaled':
+            scores = F.relu(scores) ** 2
+            scale = torch.arange(t_start + 1, t_start + scores.size(-2) + 1, device=scores.device)
+            return scores / scale.unsqueeze(0)
+        elif self.config.softmax_like == 'silu_scaled':
+            scores = F.silu(scores)
+            scale = torch.arange(t_start + 1, t_start + scores.size(-2) + 1, device=scores.device)
+            return scores / scale.unsqueeze(0)
         elif self.config.softmax_like == 'sparsemax':
             sorted_input, _ = torch.sort(scores, descending=True, dim=-1)
             cumsum_sorted = torch.cumsum(sorted_input, dim=-1)
