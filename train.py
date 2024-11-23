@@ -62,6 +62,8 @@ bias = False # do we use bias inside LayerNorm and Linear layers?
 pe = 'abs' # examples: 'abs', 'rope', 'alibi', 'nope', 'xpos2'
 flash = True # examples: 'True', 'False'
 rope_base = 10000 # RoPE base
+rope_percentage = 1.0
+rope_wavelengths = None
 xpos2_decay_base = 2.0 # Decay base
 xpos2_decay_angle = math.pi / 2 # Soft max angle
 xpos2_adaptive = True # Should we change decay angle if there's risk of overflow
@@ -205,6 +207,8 @@ model_args = dict(
     pe=pe,
     flash=flash,
     rope_base=rope_base,
+    rope_percentage=rope_percentage,
+    rope_wavelengths=rope_wavelengths,
     xpos2_decay_base=xpos2_decay_base,
     xpos2_decay_angle=xpos2_decay_angle,
     xpos2_adaptive=xpos2_adaptive,
@@ -262,7 +266,10 @@ elif init_from == 'resume':
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
     model.load_state_dict(state_dict)
     iter_num = checkpoint['iter_num']
-    best_val_loss = checkpoint['best_val_loss']
+    if 'best_val_loss' in checkpoint:
+        best_val_loss = checkpoint['best_val_loss']
+    else:
+        best_val_loss = 1e9
 elif init_from.startswith('gpt2'):
     logging.info(f"Initializing from OpenAI GPT-2 weights: {init_from}")
     # initialize from OpenAI GPT-2 weights
@@ -359,6 +366,8 @@ if master_process:
     print("pe: %s" % (pe))
     print("flash: %s" % (flash))
     print("rope_base: %f" % (rope_base))
+    print("rope_percentage: %f" % (rope_percentage))
+    print("rope_wavelengths: %s" % (rope_wavelengths))
     print("xpos2_decay_base: %f" % (xpos2_decay_base))
     print("xpos2_decay_angle: %f" % (xpos2_decay_angle))
     print("xpos2_adaptive: %s" % (xpos2_adaptive))

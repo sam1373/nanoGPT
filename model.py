@@ -27,6 +27,8 @@ import logging
 from tqdm import tqdm
 import heapq
 
+from typing import Union, List
+
 class LayerNorm(nn.Module):
     """LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False"""
 
@@ -72,7 +74,10 @@ class CausalSelfAttention(nn.Module):
         head_size = self.n_embd // self.n_head
 
         if config.pe == 'rope':
-            self.rotary_pos_emb = RotaryEmbedding(head_size, rotary_base=config.rope_base)
+            self.rotary_pos_emb = RotaryEmbedding(head_size,
+                rotary_base=config.rope_base,
+                rotary_percentage = config.rope_percentage,
+            )
         elif config.pe == 'xpos2':
             max_xpos2_pos = config.block_size * 10
             self.rotary_pos_emb = Xpos2Embedding(
@@ -699,6 +704,9 @@ class CausalSelfAttention(nn.Module):
         elif self.config.softmax_like == 'relu_scaled':
             scores = F.relu(scores)
             scale = torch.arange(t_start + 1, t_start + scores.size(-2) + 1, device=scores.device)
+            #print(scores)
+            #print(scale)
+            #print(scores / scale.unsqueeze(0))
             return scores / scale.unsqueeze(0)
         elif self.config.softmax_like == 'relu_sq_scaled':
             scores = F.relu(scores) ** 2
@@ -905,6 +913,8 @@ class GPTConfig:
     pe: str = 'rope'  # positional embeddings: 'abs', 'rope', 'alibi', 'nope', 'xpos2'
     flash: bool = False  # Should we use Flash Attention if available?
     rope_base: int = 10000  # RoPE base
+    rope_percentage: float = 1.0  # rotary_percentage
+    rope_wavelengths: Union[str, List] = None  # directly pass wavelengths, oveerriding the base
     xpos2_decay_base: float = 2.0  # Decay base
     xpos2_decay_angle: float = math.pi / 2  # Soft max angle
     xpos2_adaptive: bool = True  # Should we change decay angle if there's risk of overflow
@@ -1069,6 +1079,14 @@ class GPT(nn.Module):
             logging.info('Using ALiBi positional embeddings')
         else:
             logging.info('No positional embeddings used (NoPE)')
+
+        logging.info(f'rope_wavelengths: {self.config.rope_wavelengths}, type: {type(self.config.rope_wavelengths)}')
+        if isinstance(self.config.rope_wavelengths, str) and self.config.rope_wavelengths.startswith("["):
+            self.config.rope_wavelengths = self.config.rope_wavelengths.strip("[]").split(",")
+        if isinstance(config.rope_wavelengths, List):
+            num_rope_dims = int(config.n_embd / config.n_head * config.rope_percentage)
+            assert len(
+                config.rope_wavelengths) == num_rope_dims, f"num wavelengths in {config.rope_wavelengths} must match num rope dims {num_rope_dims}"
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # Weight tying
