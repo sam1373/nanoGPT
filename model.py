@@ -706,7 +706,7 @@ class CausalSelfAttention(nn.Module):
 
         if self.config.softmax_like == 'sigmoid_bias':
             bias = torch.arange(t_start + 1, t_start + scores.size(-2) + 1, device=scores.device)
-            return F.sigmoid(scores - torch.log(bias.unsqueeze(0)))
+            return F.sigmoid(scores - torch.log(bias[None, None, :, None]))
         elif self.config.softmax_like == 'relu_scaled':
             scores = F.relu(scores)
             scale = torch.arange(t_start + 1, t_start + scores.size(-2) + 1, device=scores.device)
