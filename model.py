@@ -65,10 +65,16 @@ class CausalSelfAttention(nn.Module):
         self.score_scale = config.score_scale
 
         sqrt_head_dim = (self.config.n_embd / self.config.n_head) ** 0.5
-        if (self.config.use_nGPT == 0):
-            self.softmax_scale = 1.0 / sqrt_head_dim
-        if (self.config.use_nGPT == 1):
-            self.softmax_scale = sqrt_head_dim
+
+        if self.config.softmax_scale is None:
+            if (self.config.use_nGPT == 0):
+                self.softmax_scale = 1.0 / sqrt_head_dim
+            if (self.config.use_nGPT == 1):
+                self.softmax_scale = sqrt_head_dim
+        else:
+            self.softmax_scale = self.config.softmax_scale
+
+        print("softmax_scale: ", self.softmax_scale)
 
         self.alibi_slopes = None
         head_size = self.n_embd // self.n_head
@@ -956,6 +962,8 @@ class GPTConfig:
     q_constant_scale: float = 1.0
 
     softmax_like: str = "softmax"
+
+    softmax_scale: float = None
 
     def __post_init__(self):
         if self.base_scale is None:

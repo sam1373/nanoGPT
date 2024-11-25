@@ -89,6 +89,7 @@ score_threshold = 0.0
 score_scale = 1.0
 q_constant_scale = 1.0
 softmax_like = 'softmax'
+softmax_scale = None
 
 precision = 'float32'
 
@@ -233,7 +234,8 @@ model_args = dict(
     score_scale=score_scale,
     q_constant_scale=q_constant_scale,
     softmax_like=softmax_like,
-    precision=precision
+    precision=precision,
+    softmax_scale=softmax_scale
 )
 if init_from == 'scratch':
     # init a new model from scratch
@@ -393,8 +395,10 @@ if master_process:
     print("score_scale: %f" % (score_scale))
     print("q_constant_scale: %f" % (q_constant_scale))
     print("softmax_like: %s" % (softmax_like))
+    print("softmax_scale: %s" % (softmax_scale))
     print("precision: %s" % (precision))
     print("batch_size: %f" % (batch_size))
+
 
 
 time_spent = time.time() - tlaunch
