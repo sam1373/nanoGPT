@@ -231,15 +231,18 @@ class DistributedDataLoader:
         self.tokens = _load_data_shard(self.files[self.current_shard])
 
     def next_batch(self):
-        batch_size = self.T * self.num_processes
-        buf = self.tokens[self.current_position:self.current_position+self.T+1]
-        buf = torch.tensor(buf.astype(np.int32), dtype=torch.long)
-        x = buf[:-1] # inputs
-        y = buf[1:] # targets
-        # advance current position and load next shard if necessary
-        self.current_position += batch_size
-        if self.current_position + batch_size >= len(self.tokens):
-            self.advance()
+        # Collect batches from multiple positions or shards
+        x_batch = []
+        y_batch = []
+        for _ in range(batch_size):
+            buf = self.tokens[self.current_position:self.current_position + self.T + 1]
+            buf = torch.tensor(buf.astype(np.int32), dtype=torch.long)
+            x_batch.append(buf[:-1])
+            y_batch.append(buf[1:])
+            self.current_position += self.T  # Move to the next position
+            # Handle shard advancement if necessary
+        x = torch.stack(x_batch)
+        y = torch.stack(y_batch)
         return x.cuda(), y.cuda()
 
 if not use_distributed_data_loader:
@@ -273,7 +276,7 @@ else:
         f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
     print(
         f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
-    print('=' * 100, logonly=True)
+    print('=' * 100)
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
