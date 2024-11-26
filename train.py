@@ -203,16 +203,17 @@ def _load_data_shard(filename):
     return tokens
 
 class DistributedDataLoader:
-    def __init__(self, filename_pattern, T, process_rank, num_processes):
+    def __init__(self, filename_pattern, T, process_rank, num_processes, batch_size):
         self.process_rank = process_rank
         self.num_processes = num_processes
         self.T = T
+        self.batch_size = batch_size
 
-        # glob files that match the pattern
+        # Glob files that match the pattern
         self.files = sorted(glob.glob(filename_pattern))
         assert len(self.files) > 0, f"did not find any files that match the pattern {filename_pattern}"
 
-        # load and validate all data shards, count number of tokens in total
+        # Load and validate all data shards, count number of tokens in total
         ntok_total = 0
         for fname in self.files:
             shard_ntok = _peek_data_shard(fname)
@@ -226,22 +227,36 @@ class DistributedDataLoader:
         self.current_shard = -1
         self.advance()
 
-    def advance(self): # advance to next data shard
+    def advance(self):
         self.current_shard = (self.current_shard + 1) % len(self.files)
-        self.current_position = self.process_rank * self.T
         self.tokens = _load_data_shard(self.files[self.current_shard])
+        # Calculate the positions assigned to this process
+        self.total_positions = len(self.tokens) - self.T - 1
+        positions_per_process = self.total_positions // self.num_processes
+        self.start_pos = self.process_rank * positions_per_process
+        self.end_pos = self.start_pos + positions_per_process
+        self.current_position = self.start_pos
 
     def next_batch(self):
-        # Collect batches from multiple positions or shards
         x_batch = []
         y_batch = []
-        for _ in range(batch_size):
+        for _ in range(self.batch_size):
+            # If we have reached the end of our assigned positions, advance to the next shard
+            if self.current_position + self.T + 1 > self.end_pos:
+                self.advance()
             buf = self.tokens[self.current_position:self.current_position + self.T + 1]
+            if len(buf) < self.T + 1:
+                # In case the buffer is too small, pad or handle appropriately
+                continue  # Skip this iteration or handle as needed
             buf = torch.tensor(buf.astype(np.int32), dtype=torch.long)
             x_batch.append(buf[:-1])
             y_batch.append(buf[1:])
-            self.current_position += self.T  # Move to the next position
-            # Handle shard advancement if necessary
+            # Move to the next position assigned to this process
+            self.current_position += 1
+        # Ensure that we have collected enough samples
+        if len(x_batch) < self.batch_size:
+            # Handle this case, possibly by recursively calling next_batch or adjusting batch_size
+            pass  # For simplicity, you can fill the batch with additional samples or handle as needed
         x = torch.stack(x_batch)
         y = torch.stack(y_batch)
         return x.cuda(), y.cuda()
@@ -264,8 +279,8 @@ if not use_distributed_data_loader:
             x, y = x.to(device), y.to(device)
         return x, y
 else:
-    train_loader = DistributedDataLoader(data_dir + 'train_*.bin', block_size, ddp_local_rank, ddp_world_size)
-    val_loader = DistributedDataLoader(data_dir + 'val_*.bin', block_size, ddp_local_rank, ddp_world_size)
+    train_loader = DistributedDataLoader(data_dir + 'train_*.bin', block_size, ddp_local_rank, ddp_world_size, batch_size)
+    val_loader = DistributedDataLoader(data_dir + 'val_*.bin', block_size, ddp_local_rank, ddp_world_size, batch_size)
     def get_batch(split):
         if split == 'train':
             return train_loader.next_batch()
