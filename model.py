@@ -892,6 +892,9 @@ class MLP(nn.Module):
             self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias, dtype=self.config.dtype)
             self.dropout = nn.Dropout(config.dropout)
 
+        if self.config.modded:
+            self.c_proj.weight.data.zero_()
+
     def forward(self, x):
         if self.config.use_nGPT == 1:
             uv = self.c_fc(x)
@@ -964,6 +967,8 @@ class GPTConfig:
     softmax_like: str = "softmax"
 
     softmax_scale: float = None
+
+    modded: bool = False
 
     def __post_init__(self):
         if self.base_scale is None:
@@ -1097,8 +1102,12 @@ class GPT(nn.Module):
                 config.rope_wavelengths) == num_rope_dims, f"num wavelengths in {config.rope_wavelengths} must match num rope dims {num_rope_dims}"
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        # Weight tying
-        self.transformer.wte.weight = self.lm_head.weight  # https://paperswithcode.com/method/weight-tying
+
+        if not self.config.modded:
+            # Weight tying
+            self.transformer.wte.weight = self.lm_head.weight  # https://paperswithcode.com/method/weight-tying
+        else:
+            self.lm_head.weight.data.zero_()
 
         # Initialize all weights
         self.apply(self._init_weights)
@@ -1141,6 +1150,10 @@ class GPT(nn.Module):
             else:
                 torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
+    def justnorm(self, x):
+        res = x / x.norm(p=2, dim=-1, keepdim=True)
+        return res
+
     def forward(self, idx, targets=None, collect_info=False, collect_probs_per_layer=False, kv_cache=None, return_kv_cache=False):
         device = idx.device
         b, t = idx.size()
@@ -1154,6 +1167,9 @@ class GPT(nn.Module):
 
         # Forward the GPT model itself
         tok_emb = self.transformer.wte(idx)  # Shape: (b, t, n_embd)
+        if self.config.modded:
+            tok_emb = self.justnorm(tok_emb)
+
         if self.config.pe == 'abs':
             pos_emb = self.transformer.wpe(pos)  # Shape: (t, n_embd)
             x = self.transformer.drop(tok_emb + pos_emb)  # Shape: (b, t, n_embd)
@@ -1199,12 +1215,18 @@ class GPT(nn.Module):
             if self.config.use_nGPT == 1:
                 sz = self.sz * (self.sz_init_value / self.sz_init_scaling)
                 logits = sz * logits
+            if self.config.modded:
+                logits = 30 * torch.tanh(logits / 30)
+                logits = logits.float()
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             logits = self.lm_head(x[:, [-1], :])  # Shape: (b, 1, vocab_size)
             if self.config.use_nGPT == 1:
                 sz = self.sz * (self.sz_init_value / self.sz_init_scaling)
                 logits = sz * logits
+            if self.config.modded:
+                logits = 30 * torch.tanh(logits / 30)
+                logits = logits.float()
             loss = None
 
         """if collect_info and collect_probs_per_layer:
