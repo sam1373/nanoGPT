@@ -176,6 +176,11 @@ class CausalSelfAttention(nn.Module):
             q = sqk * self.justnorm(q)
             k = sqk * self.justnorm(k)
 
+            #print(q.shape, k.shape)
+            #print(q.norm(dim=-1).mean(), k.norm(dim=-1).mean())
+            #print(q.norm(dim=-1).std(), k.norm(dim=-1).std())
+            #what are the norms really
+
         if pos is None or kv_cache is not None:
             pos = torch.arange(0, k.shape[2], dtype=torch.long, device=device)
 
@@ -315,7 +320,7 @@ class CausalSelfAttention(nn.Module):
                 attn = F.silu(attn)
                 attn = attn.masked_fill(torch.tril(torch.ones(T, T, device=device)).unsqueeze(0).unsqueeze(0) == 0, float('-inf'))
 
-            attn_probs = self.softmax_like(attn, k.shape[2] - q.shape[2])
+            attn_probs = self.softmax_like(attn, k.shape[2] - q.shape[2], v)
             #right-alignment
 
             attn_probs = self._apply_probability_modifications(attn_probs)
@@ -499,7 +504,7 @@ class CausalSelfAttention(nn.Module):
                     attn_scores_chunk = self._apply_additional_configs_inference(attn_scores_chunk)
 
                     # Compute attention probabilities
-                    attn_probs_chunk = self.softmax_like(attn_scores_chunk, t_start)
+                    attn_probs_chunk = self.softmax_like(attn_scores_chunk, t_start, v_chunk)
 
                     # Apply probability modifications (top-k, top-p, etc.)
                     attn_probs_chunk = self._apply_probability_modifications(attn_probs_chunk)
@@ -648,7 +653,7 @@ class CausalSelfAttention(nn.Module):
                 #    attn_probs_chunk = torch.sigmoid(attn_scores_chunk - torch.log(1e-8 + T))
                 #else:
 
-                attn_probs_chunk = self.softmax_like(attn_scores_chunk, t_start)
+                attn_probs_chunk = self.softmax_like(attn_scores_chunk, t_start, v_chunk)
                 #F.softmax(attn_scores_chunk, dim=-1)
 
                 # Apply probability modifications (top-k, top-p, etc.)
@@ -702,7 +707,7 @@ class CausalSelfAttention(nn.Module):
 
         return weighted_v, extra_info
 
-    def softmax_like(self, scores, t_start=0):
+    def softmax_like(self, scores, t_start=0, v=None):
 
         if self.config.softmax_like == 'sigmoid_bias':
             bias = torch.arange(t_start + 1, t_start + scores.size(-2) + 1, device=scores.device)
@@ -739,6 +744,34 @@ class CausalSelfAttention(nn.Module):
             thr, _ = scores.max(dim = -1)
             thr *= 0.2
             scores = torch.clamp(scores - thr.unsqueeze(-1), min=0)
+            return scores
+        elif self.config.softmax_like == 'pre_softmax_threshold':
+            thr, _ = scores.max(dim = -1)
+            thr = thr - 2
+            thr = torch.clamp(thr, min=0)
+            thr = thr.unsqueeze(-1)
+            scores -= thr
+            scores[scores < 0] *= 100
+            return F.softmax(scores, dim = -1)
+        elif self.config.softmax_like == 'min_p_x_vnorm':
+            scores = F.softmax(scores, dim=-1)
+            v_norm = v.norm(dim=-1).unsqueeze(-2)
+            s_x_vnorm = scores * v_norm
+            max_s_x_vnorm, _ = torch.max(s_x_vnorm, dim=-1, keepdim=True)
+            s_x_vnorm_thr = torch.clamp(max_s_x_vnorm * 0.2, 0)
+            s_x_vnorm_mask = s_x_vnorm >= s_x_vnorm_thr
+            scores[~s_x_vnorm_mask] = 0
+            scores /= scores.sum(dim=-1, keepdim=True) + 1e-8
+            return scores
+        elif self.config.softmax_like == 'min_s_x_vnorm_softmax':
+            v_norm = v.norm(dim=-1).unsqueeze(-2)
+            s_x_vnorm = scores * v_norm
+            max_s_x_vnorm, _ = torch.max(s_x_vnorm, dim=-1, keepdim=True)
+            s_x_vnorm_thr = torch.clamp(max_s_x_vnorm * 0.2, 0)
+            s_x_vnorm_mask = s_x_vnorm >= s_x_vnorm_thr
+            scores[~s_x_vnorm_mask] = float('-inf')
+            return F.softmax(scores, dim=-1)
+        elif self.config.softmax_like == 'min_p_x_vnorm_learn_thr':
             return scores
         else:
             return F.softmax(scores, dim=-1)

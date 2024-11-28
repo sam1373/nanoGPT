@@ -118,6 +118,8 @@ compile = True # use PyTorch 2.0 to compile the model to be faster
 
 time_limit_seconds = 14400
 
+starting_checkpoint = None
+
 tlaunch = time.time()
 print("Current Directory:", os.getcwd())
 # the input configurations will overwrite all configs given above!
@@ -363,10 +365,14 @@ elif init_from == 'resume':
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
+
+    print("checkpoint_model_args:", checkpoint_model_args)
     # force these config attributes to be equal otherwise we can't even resume training
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = checkpoint_model_args[k]
+
+    print("model_args:", model_args)
     # create the model
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
@@ -391,6 +397,35 @@ elif init_from.startswith('gpt2'):
     # read off the created config params, so we can store them into checkpoint correctly
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = getattr(model.config, k)
+elif init_from == 'start_from':
+    logging.info(f"Initializing from {starting_checkpoint}")
+    # initialize from a checkpoint
+    checkpoint = torch.load(starting_checkpoint, map_location=device)
+    checkpoint_model_args = checkpoint['model_args']
+
+    print("checkpoint_model_args:", checkpoint_model_args)
+    # force these config attributes to be equal otherwise we can't even resume training
+    # the rest of the attributes (e.g. dropout) can stay as desired from command line
+    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+        model_args[k] = checkpoint_model_args[k]
+
+    print("model_args:", model_args)
+    # create the model
+    gptconf = GPTConfig(**model_args)
+    model = GPT(gptconf)
+    state_dict = checkpoint['model']
+    # fix the keys of the state dictionary :(
+    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
+    unwanted_prefix = '_orig_mod.'
+    for k,v in list(state_dict.items()):
+        if k.startswith(unwanted_prefix):
+            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+    model.load_state_dict(state_dict)
+    if 'best_val_loss' in checkpoint:
+        best_val_loss = checkpoint['best_val_loss']
+    else:
+        best_val_loss = 1e9
+
 # crop down the model block size if desired, using model surgery
 if block_size < model.config.block_size:
     model.crop_block_size(block_size)
