@@ -758,8 +758,8 @@ class CausalSelfAttention(nn.Module):
             thr = thr - 1.6
             thr = torch.clamp(thr, min=0)
             thr = thr.unsqueeze(-1)
-            scores -= thr
-            scores[scores < 0] *= 100
+            scores = scores - thr
+            scores = torch.where(scores < 0, scores * 100, scores)
             return F.softmax(scores, dim = -1)
         elif self.config.softmax_like == 'pre_softmax_soft_threshold':
             thr, _ = scores.max(dim=-1)
@@ -776,8 +776,7 @@ class CausalSelfAttention(nn.Module):
             s_x_vnorm = scores * v_norm
             max_s_x_vnorm, _ = torch.max(s_x_vnorm, dim=-1, keepdim=True)
             s_x_vnorm_thr = torch.clamp(max_s_x_vnorm * 0.2, 0)
-            s_x_vnorm_mask = s_x_vnorm >= s_x_vnorm_thr
-            scores[~s_x_vnorm_mask] = 0
+            scores = torch.where(s_x_vnorm >= s_x_vnorm_thr, scores, 0)
             scores /= scores.sum(dim=-1, keepdim=True) + 1e-8
             return scores
         elif self.config.softmax_like == 'min_s_x_vnorm_softmax':
