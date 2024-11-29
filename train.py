@@ -95,6 +95,7 @@ softmax_scale = None
 modded = False
 use_pseudo_flash = False
 pseudo_flash_chunk_size = 512
+do_lns = True
 
 precision = 'float32'
 
@@ -352,7 +353,8 @@ model_args = dict(
     softmax_scale=softmax_scale,
     modded=modded,
     use_pseudo_flash=use_pseudo_flash,
-    pseudo_flash_chunk_size=pseudo_flash_chunk_size
+    pseudo_flash_chunk_size=pseudo_flash_chunk_size,
+    do_lns=do_lns
 )
 if init_from == 'scratch':
     # init a new model from scratch
@@ -424,7 +426,7 @@ elif init_from == 'start_from':
     for k,v in list(state_dict.items()):
         if k.startswith(unwanted_prefix):
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-    model.load_state_dict(state_dict)
+    model.load_state_dict(state_dict, strict=False)
     if 'best_val_loss' in checkpoint:
         best_val_loss = checkpoint['best_val_loss']
     else:

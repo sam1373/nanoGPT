@@ -111,6 +111,14 @@ class CausalSelfAttention(nn.Module):
             self.sqk_init_scaling = config.base_scale
             self.sqk = nn.Parameter(self.sqk_init_scaling * torch.ones(config.n_embd, dtype=torch.float32))
 
+        if self.config.softmax_like == 'pre_softmax_soft_threshold':
+            #initialize learnable threshold and steepness per head
+            self.thr_c = nn.Parameter(1.6 * torch.ones(self.n_head, dtype=torch.float32))
+            self.stp = nn.Parameter(10.0 * torch.ones(self.n_head, dtype=torch.float32))
+
+            print("thr_c:", self.thr_c)
+            print("stp:", self.stp)
+
     def justnorm(self, x):
         res = x / x.norm(p=2, dim=-1, keepdim=True)
         return res
@@ -747,12 +755,21 @@ class CausalSelfAttention(nn.Module):
             return scores
         elif self.config.softmax_like == 'pre_softmax_threshold':
             thr, _ = scores.max(dim = -1)
-            thr = thr - 2
+            thr = thr - 1.6
             thr = torch.clamp(thr, min=0)
             thr = thr.unsqueeze(-1)
             scores -= thr
             scores[scores < 0] *= 100
             return F.softmax(scores, dim = -1)
+        elif self.config.softmax_like == 'pre_softmax_soft_threshold':
+            thr, _ = scores.max(dim=-1)
+            #use the threshold parameter
+            thr = thr - self.thr_c[None, :, None]
+            m = torch.sigmoid((scores - thr.unsqueeze(-1)) * self.stp[None, :, None, None])
+            #print("scores:", scores)
+            #print("log m:", torch.log(m + 1e-8))
+            scores = scores + torch.log(m + 1e-8)
+            return F.softmax(scores, dim=-1)
         elif self.config.softmax_like == 'min_p_x_vnorm':
             scores = F.softmax(scores, dim=-1)
             v_norm = v.norm(dim=-1).unsqueeze(-2)
@@ -1002,6 +1019,7 @@ class GPTConfig:
     softmax_scale: float = None
 
     modded: bool = False
+    do_lns: bool = True
 
     def __post_init__(self):
         if self.base_scale is None:
@@ -1064,7 +1082,8 @@ class Block(nn.Module):
                 x = x + mlp_out
             return x, attn_info
         else:
-            ln1_out = self.ln_1(x)
+            if self.config.do_lns:
+                ln1_out = self.ln_1(x)
             attn_out = self.attn(ln1_out, pos=pos, kv_cache=kv_cache, return_kv_cache=return_kv_cache)
             if return_kv_cache:
                 attn_out, kv_cache = attn_out
@@ -1080,7 +1099,8 @@ class Block(nn.Module):
             else:
                 x = x + attn_out
 
-            ln2_out = self.ln_2(x)
+            if self.config.do_lns:
+                ln2_out = self.ln_2(x)
             mlp_out = self.mlp(ln2_out)
             if self.config.use_nGPT == 1:
                 lr = self.mlp_alpha * (self.mlp_alpha_init_value / self.mlp_alpha_init_scaling)
@@ -1241,7 +1261,8 @@ class GPT(nn.Module):
                     layer_logits = self.lm_head(x0[:, [-1], :])
                 logits_per_layer.append(layer_logits)
 
-        x = self.transformer.ln_f(x)  # Shape: (b, t, n_embd)
+        if self.config.do_lns:
+            x = self.transformer.ln_f(x)  # Shape: (b, t, n_embd)
 
         if targets is not None:
             logits = self.lm_head(x)  # Shape: (b, t, vocab_size)
