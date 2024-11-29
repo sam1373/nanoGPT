@@ -1083,6 +1083,8 @@ class Block(nn.Module):
         else:
             if self.config.do_lns:
                 ln1_out = self.ln_1(x)
+            else:
+                ln1_out = x
             attn_out = self.attn(ln1_out, pos=pos, kv_cache=kv_cache, return_kv_cache=return_kv_cache)
             if return_kv_cache:
                 attn_out, kv_cache = attn_out
@@ -1100,6 +1102,8 @@ class Block(nn.Module):
 
             if self.config.do_lns:
                 ln2_out = self.ln_2(x)
+            else:
+                ln2_out = x
             mlp_out = self.mlp(ln2_out)
             if self.config.use_nGPT == 1:
                 lr = self.mlp_alpha * (self.mlp_alpha_init_value / self.mlp_alpha_init_scaling)
