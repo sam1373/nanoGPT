@@ -93,6 +93,8 @@ q_constant_scale = 1.0
 softmax_like = 'softmax'
 softmax_scale = None
 modded = False
+use_pseudo_flash = False
+pseudo_flash_chunk_size = 512
 
 precision = 'float32'
 
@@ -348,7 +350,9 @@ model_args = dict(
     softmax_like=softmax_like,
     precision=precision,
     softmax_scale=softmax_scale,
-    modded=modded
+    modded=modded,
+    use_pseudo_flash=use_pseudo_flash,
+    pseudo_flash_chunk_size=pseudo_flash_chunk_size
 )
 if init_from == 'scratch':
     # init a new model from scratch
