@@ -113,8 +113,8 @@ class CausalSelfAttention(nn.Module):
 
         if self.config.softmax_like == 'pre_softmax_soft_threshold':
             #initialize learnable threshold and steepness per head
-            self.thr_c = nn.Parameter(1.6 * torch.ones(self.n_head, dtype=torch.float32))
-            self.stp = nn.Parameter(10.0 * torch.ones(self.n_head, dtype=torch.float32))
+            self.thr_c = nn.Parameter(2.0 * torch.ones(self.n_head, dtype=torch.float32), requires_grad=True)
+            self.stp = nn.Parameter(10.0 * torch.ones(self.n_head, dtype=torch.float32), requires_grad=False)
 
             print("thr_c:", self.thr_c)
             print("stp:", self.stp)
