@@ -878,14 +878,21 @@ class CausalSelfAttention(nn.Module):
         """
         Applies probability modifications like top-k, top-p filtering to the attention probabilities.
         """
-        # Apply top-k after softmax
+        renormalize = False
+
+        # top k
         if self.config.topk_after_attn_softmax > 0:
-            top_n_values, top_n_indices = torch.topk(attn_probs_chunk, self.config.topk_after_attn_softmax, dim=-1)
-            mask = torch.zeros_like(attn_probs_chunk)
-            mask.scatter_(-1, top_n_indices, 1.0)
+            K = self.config.topk_after_attn_softmax
+            N = attn_probs_chunk.size(-1)
+
+            kth_position = N - K + 1
+
+            kth_val, _ = torch.kthvalue(attn_probs_chunk, kth_position, dim=-1, keepdim=True)
+
+            mask = attn_probs_chunk >= kth_val
+
             attn_probs_chunk = attn_probs_chunk * mask
-            attn_probs_sum = attn_probs_chunk.sum(dim=-1, keepdim=True) + 1e-8
-            attn_probs_chunk = attn_probs_chunk / attn_probs_sum
+            renormalize = True
 
         # Apply top-p filtering
         if self.config.top_p > 0:
@@ -904,8 +911,9 @@ class CausalSelfAttention(nn.Module):
             min_threshold = max_probs * self.config.min_p
             min_p_mask = attn_probs_chunk >= min_threshold
             attn_probs_chunk = attn_probs_chunk * min_p_mask
-            attn_probs_sum = attn_probs_chunk.sum(dim=-1, keepdim=True) + 1e-8
-            attn_probs_chunk = attn_probs_chunk / attn_probs_sum
+            #attn_probs_sum = attn_probs_chunk.sum(dim=-1, keepdim=True) + 1e-8
+            #attn_probs_chunk = attn_probs_chunk / attn_probs_sum
+            renormalize = True
 
         # Apply top_a filtering
         if self.config.top_a > 0:
@@ -913,6 +921,11 @@ class CausalSelfAttention(nn.Module):
             threshold = (max_probs ** 2) * self.config.top_a
             top_a_mask = attn_probs_chunk >= threshold
             attn_probs_chunk = attn_probs_chunk * top_a_mask
+            #attn_probs_sum = attn_probs_chunk.sum(dim=-1, keepdim=True) + 1e-8
+            #attn_probs_chunk = attn_probs_chunk / attn_probs_sum
+            renormalize = True
+
+        if renormalize:
             attn_probs_sum = attn_probs_chunk.sum(dim=-1, keepdim=True) + 1e-8
             attn_probs_chunk = attn_probs_chunk / attn_probs_sum
 
@@ -926,6 +939,7 @@ class CausalSelfAttention(nn.Module):
                 token_indices = torch.arange(T, device=k_g.device).unsqueeze(0).unsqueeze(0)
                 heads = torch.arange(self.n_head, device=k_g.device).unsqueeze(0).unsqueeze(-1)
                 mask_indices = token_indices + heads + self.layer_id
+                mask_indices //= self.config.sparse_k_g_group_size
                 mask = (mask_indices % self.config.sparse_k_g_mod == 0)
                 mask = mask.unsqueeze(-1)  # [1, n_head, T, 1]
                 mask[:, :, :self.config.sparse_k_g_keepstart, :] = True
@@ -935,6 +949,7 @@ class CausalSelfAttention(nn.Module):
                 token_indices = torch.arange(T, device=k_g.device).unsqueeze(0).unsqueeze(0)
                 heads = torch.arange(self.n_head, device=k_g.device).unsqueeze(0).unsqueeze(-1)
                 mask_indices = token_indices + heads
+                mask_indices //= self.config.sparse_k_g_group_size
                 mask = (mask_indices % self.config.sparse_k_g_mod == 0)
                 mask = mask.unsqueeze(-1)  # [1, n_head, T, 1]
                 mask[:, :, :self.config.sparse_k_g_keepstart, :] = True
@@ -943,6 +958,7 @@ class CausalSelfAttention(nn.Module):
             elif self.config.sparse_k_g_type == 'fixed':
                 token_indices = torch.arange(T, device=k_g.device).unsqueeze(0).unsqueeze(0)
                 mask_indices = token_indices
+                mask_indices //= self.config.sparse_k_g_group_size
                 mask = (mask_indices % self.config.sparse_k_g_mod == 0)
                 mask = mask.unsqueeze(-1)  # [1, n_head, T, 1]
                 mask[:, :, :self.config.sparse_k_g_keepstart, :] = True
@@ -1051,6 +1067,7 @@ class GPTConfig:
     sparse_k_g_type: str = 'head'
     sparse_k_g_mod: int = 2
     sparse_k_g_keepstart: int = 1024
+    sparse_k_g_group_size: int = 1
 
     def __post_init__(self):
         if self.base_scale is None:
