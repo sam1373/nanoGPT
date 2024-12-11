@@ -42,7 +42,7 @@ class LayerNorm(nn.Module):
 
 class CausalSelfAttention(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, layer_id=0):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         self.config = config
@@ -63,6 +63,7 @@ class CausalSelfAttention(nn.Module):
         self.silu_before_attn_softmax = config.silu_before_attn_softmax
         self.score_threshold = config.score_threshold
         self.score_scale = config.score_scale
+        self.layer_id = layer_id
 
         sqrt_head_dim = (self.config.n_embd / self.config.n_head) ** 0.5
 
@@ -239,6 +240,8 @@ class CausalSelfAttention(nn.Module):
                     # Implement xpos2 positional encodings if needed
                     pass
 
+                ngb_k = self.sparsify_k_g(ngb_k)
+
                 # Compute normal attention
                 ngb_attn = torch.matmul(ngb_q, ngb_k.transpose(-2, -1)) * self.softmax_scale
                 # * (1.0 / math.sqrt(k.size(-1)))
@@ -388,16 +391,6 @@ class CausalSelfAttention(nn.Module):
             return y
 
     def apply_right_aligned_causal_mask(self, attn_scores):
-        """
-        Apply a right-aligned causal mask to the given attention scores.
-
-        Args:
-            attn_scores (torch.Tensor): Attention scores of shape (B, n_head, T_q, T_k),
-                                 where T_q is the length of queries and T_k is the length of keys.
-
-        Returns:
-            torch.Tensor: Masked attention scores.
-        """
         # Get the sizes of T_q (queries) and T_k (keys)
         T_q = attn_scores.size(-2)
         T_k = attn_scores.size(-1)
@@ -488,6 +481,8 @@ class CausalSelfAttention(nn.Module):
                     elif self.config.pe == 'xpos2':
                         # Implement xpos2 positional encodings if needed
                         pass
+
+                    k_chunk_grp = self.sparsify_k_g(k_chunk_grp)
 
                     attn_scores_chunk_grp = torch.matmul(q_chunk_grp, k_chunk_grp.transpose(-2, -1)) * self.softmax_scale
                     # * (
@@ -923,6 +918,38 @@ class CausalSelfAttention(nn.Module):
 
         return attn_probs_chunk
 
+    def sparsify_k_g(self, k_g):
+        B, n_head, T, head_dim = k_g.shape
+        #print(k_g.shape)
+        if self.config.sparse_k_g:
+            if self.config.sparse_k_g_type == 'head_layer':
+                token_indices = torch.arange(T, device=k_g.device).unsqueeze(0).unsqueeze(0)
+                heads = torch.arange(self.n_head, device=k_g.device).unsqueeze(0).unsqueeze(-1)
+                mask_indices = token_indices + heads + self.layer_id
+                mask = (mask_indices % self.config.sparse_k_g_mod == 0)
+                mask = mask.unsqueeze(-1)  # [1, n_head, T, 1]
+                mask[:, :, :self.config.sparse_k_g_keepstart, :] = True
+                mask = mask.expand(B, n_head, T, head_dim)  # [B, n_head, T, head_dim]
+                k_g = k_g * mask
+            elif self.config.sparse_k_g_type == 'head':
+                token_indices = torch.arange(T, device=k_g.device).unsqueeze(0).unsqueeze(0)
+                heads = torch.arange(self.n_head, device=k_g.device).unsqueeze(0).unsqueeze(-1)
+                mask_indices = token_indices + heads
+                mask = (mask_indices % self.config.sparse_k_g_mod == 0)
+                mask = mask.unsqueeze(-1)  # [1, n_head, T, 1]
+                mask[:, :, :self.config.sparse_k_g_keepstart, :] = True
+                mask = mask.expand(B, n_head, T, head_dim)  # [B, n_head, T, head_dim]
+                k_g = k_g * mask
+            elif self.config.sparse_k_g_type == 'fixed':
+                token_indices = torch.arange(T, device=k_g.device).unsqueeze(0).unsqueeze(0)
+                mask_indices = token_indices
+                mask = (mask_indices % self.config.sparse_k_g_mod == 0)
+                mask = mask.unsqueeze(-1)  # [1, n_head, T, 1]
+                mask[:, :, :self.config.sparse_k_g_keepstart, :] = True
+                mask = mask.expand(B, n_head, T, head_dim)  # [B, n_head, T, head_dim]
+                k_g = k_g * mask
+        return k_g
+
 class MLP(nn.Module):
 
     def __init__(self, config):
@@ -1020,6 +1047,11 @@ class GPTConfig:
     modded: bool = False
     do_lns: bool = True
 
+    sparse_k_g: bool = False
+    sparse_k_g_type: str = 'head'
+    sparse_k_g_mod: int = 2
+    sparse_k_g_keepstart: int = 1024
+
     def __post_init__(self):
         if self.base_scale is None:
             self.base_scale = 1.0 / (self.n_embd ** 0.5)
@@ -1029,11 +1061,11 @@ class GPTConfig:
 
 class Block(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, layer_id=0):
         super().__init__()
         self.config = config
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
+        self.attn = CausalSelfAttention(config, layer_id=layer_id)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
@@ -1132,7 +1164,7 @@ class GPT(nn.Module):
         self.transformer = nn.ModuleDict()
         self.transformer['wte'] = nn.Embedding(config.vocab_size, config.n_embd)
         self.transformer['drop'] = nn.Dropout(config.dropout)
-        self.transformer['h'] = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
+        self.transformer['h'] = nn.ModuleList([Block(config, lid) for lid in range(config.n_layer)])
         self.transformer['ln_f'] = LayerNorm(config.n_embd, bias=config.bias)
 
         assert self.config.pe in {'abs', 'rope', 'alibi', 'nope', 'xpos2'}, f"Invalid value for pe: {self.config.pe}"
