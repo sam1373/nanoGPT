@@ -347,7 +347,7 @@ class CausalSelfAttention(nn.Module):
                 weighted_v = torch.matmul(attn_probs, v)
                 weighted_v_norms = weighted_v.norm(dim=-1)
 
-                effective_top_k = min(5, T)
+                effective_top_k = min(5, q.shape[-1])
                 topk_values, topk_indices = torch.topk(attn_probs, k=effective_top_k, dim=-1)
                 att_probs_excl_topk = attn_probs.clone()
                 att_probs_excl_topk.scatter_(
@@ -1343,6 +1343,9 @@ class GPT(nn.Module):
             return logits, loss, logits_per_layer
         else:"""
 
+        if collect_info:
+            return logits, attn_info_per_layer
+
         if return_kv_cache:
             return logits, kv_cache_per_layer
 
@@ -1496,20 +1499,14 @@ class GPT(nn.Module):
         initial_context_length = seq_len  # The length of the initial context
 
         # Collect info for initial context
-        """
-        if collect_info or collect_probs_per_layer:
-            outputs = self(idx_cond, collect_info=collect_info, collect_probs_per_layer=collect_probs_per_layer)
-            if collect_info and collect_probs_per_layer:
-                logits, _, attn_info_per_layer, logits_per_layer, hidden_states = outputs
-            elif collect_info:
-                logits, _, attn_info_per_layer, hidden_states = outputs
-            elif collect_probs_per_layer:
-                logits, _, logits_per_layer = outputs
+
+        if collect_info:
+            logits, attn_info_per_layer = self(idx_cond, collect_info=collect_info, collect_probs_per_layer=collect_probs_per_layer)
         else:
             logits, _ = self(idx_cond)
 
-        if collect_probs_per_layer:
-            logits_per_layer_generated.extend(logits_per_layer)
+        #if collect_probs_per_layer:
+        #     logits_per_layer_generated.extend(logits_per_layer)
 
         if collect_info:
             # Decode tokens individually
@@ -1535,8 +1532,9 @@ class GPT(nn.Module):
                     token_norms[i]['k_norms'].append(k_norms[:, i])
                     token_norms[i]['v_norms'].append(v_norms[:, i])
 
+
             # Collect token info
-            for i in tqdm(range(seq_len)):
+            for i in tqdm(range(seq_len - 10, seq_len)):
                 token_id = token_ids[i]
                 decoded_token = decoded_tokens[i]
                 decoded_token = decoded_token if decoded_token else None
@@ -1621,7 +1619,7 @@ class GPT(nn.Module):
                     })
                 next_token_probs_per_layer.append(next_token_probs_layer)
             token_info['next_token_probs_per_layer'] = next_token_probs_per_layer
-"""
+
         next_token_probs_list = []
 
         kv_cache = None
@@ -1629,6 +1627,8 @@ class GPT(nn.Module):
         idx_cond = idx
 
         use_kv_cache = True
+
+        #collect_info = False
 
         # Start generating new tokens
         for t in tqdm(range(max_new_tokens), desc="Generating tokens"):
@@ -1724,7 +1724,7 @@ class GPT(nn.Module):
             decoded_token = decode([token_id]) if decode else None
 
 
-            if collect_info:
+            if 0 and collect_info:
                 token_info = {
                     'token_id': token_id,
                     'decoded_token': decoded_token,
@@ -1732,7 +1732,7 @@ class GPT(nn.Module):
                     'attn_info_per_layer': [],
                     'next_token_probs': next_token_probs,
                     'most_similar_tokens': [],
-                    'next_token_probs_per_layer': next_token_probs_per_layer,  # Add per-layer next token probabilities
+                    #'next_token_probs_per_layer': next_token_probs_per_layer,  # Add per-layer next token probabilities
                 }
                 current_token_idx = idx.size(1) - 2  # Index of current token
                 token_norm = {
