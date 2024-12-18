@@ -347,7 +347,7 @@ class CausalSelfAttention(nn.Module):
                 weighted_v = torch.matmul(attn_probs, v)
                 weighted_v_norms = weighted_v.norm(dim=-1)
 
-                effective_top_k = min(5, q.shape[-1])
+                effective_top_k = 100#min(100, q.shape[-1])
                 topk_values, topk_indices = torch.topk(attn_probs, k=effective_top_k, dim=-1)
                 att_probs_excl_topk = attn_probs.clone()
                 att_probs_excl_topk.scatter_(
@@ -606,7 +606,7 @@ class CausalSelfAttention(nn.Module):
                     embedding_norms_chunk = x[:, t_start:t_end, :].norm(dim=-1).unsqueeze(1).expand(-1, self.n_head, -1)
                     weighted_v_norms_chunk = weighted_v_chunk.norm(dim=-1)
 
-                    effective_top_k = min(5, attn_probs_chunk.size(-1))
+                    effective_top_k = 100#min(100, attn_probs_chunk.size(-1))
                     topk_values_to, topk_indices_to = torch.topk(attn_probs_chunk, k=effective_top_k, dim=-1)
                     att_probs_T_chunk = attn_probs_chunk.transpose(-2, -1)
                     topk_values_from, topk_indices_from = torch.topk(att_probs_T_chunk, k=effective_top_k, dim=-1)
@@ -677,7 +677,7 @@ class CausalSelfAttention(nn.Module):
                     embedding_norms_chunk = x[:, t_start:t_end, :].norm(dim=-1).unsqueeze(1).expand(-1, self.n_head, -1)
                     weighted_v_norms_chunk = weighted_v_chunk.norm(dim=-1)
 
-                    effective_top_k = min(5, attn_probs_chunk.size(-1))
+                    effective_top_k = 100#min(100, attn_probs_chunk.size(-1))
                     topk_values_to, topk_indices_to = torch.topk(attn_probs_chunk, k=effective_top_k, dim=-1)
                     att_probs_T_chunk = attn_probs_chunk.transpose(-2, -1)
                     topk_values_from, topk_indices_from = torch.topk(att_probs_T_chunk, k=effective_top_k, dim=-1)
@@ -1534,7 +1534,7 @@ class GPT(nn.Module):
 
 
             # Collect token info
-            for i in tqdm(range(seq_len - 10, seq_len)):
+            for i in tqdm(range(seq_len - 15, seq_len)):
                 token_id = token_ids[i]
                 decoded_token = decoded_tokens[i]
                 decoded_token = decoded_token if decoded_token else None
@@ -1589,7 +1589,7 @@ class GPT(nn.Module):
                             else:
                                 top_tokens_dict[idx_from] = attn_score
                         # Keep top K tokens
-                        top_k_attn = 5
+                        top_k_attn = 100
                         top_k_tokens = heapq.nlargest(top_k_attn, top_tokens_dict.items(), key=lambda x: x[1])
                         attention_scores[i]['top_tokens_attending_to'][layer_idx][head_idx] = top_k_tokens
 
@@ -1627,6 +1627,28 @@ class GPT(nn.Module):
         idx_cond = idx
 
         use_kv_cache = True
+
+        if collect_info:
+            # Include initial context length in the generated_info
+            generated_info[0]['initial_context_length'] = initial_context_length
+            # Include attention_scores and token_norms in the generated_info
+            for idx_info, info in enumerate(generated_info):
+                info['attention_scores'] = attention_scores[idx_info]
+                info['token_norms'] = token_norms[idx_info]
+
+            # Compute total attention falling on each token per layer and head
+            for idx_info, info in enumerate(generated_info):
+                total_attention_per_layer_head = []
+                for layer_idx in range(num_layers):
+                    layer_total_attention = []
+                    for head_idx in range(num_heads):
+                        total_attention = sum(
+                            score for idx_from, score in
+                            info['attention_scores']['top_tokens_attending_to'][layer_idx][head_idx]
+                        )
+                        layer_total_attention.append(total_attention)
+                    total_attention_per_layer_head.append(layer_total_attention)
+                info['total_attention_per_layer_head'] = total_attention_per_layer_head
 
         #collect_info = False
 
@@ -1788,7 +1810,7 @@ class GPT(nn.Module):
                                     top_tokens_dict[current_token_idx] = attention_score
 
                                 # Keep top K tokens
-                                top_k_attn = 5
+                                top_k_attn = 100
                                 top_k_tokens = heapq.nlargest(top_k_attn, top_tokens_dict.items(), key=lambda x: x[1])
                                 attention_scores[target_idx]['top_tokens_attending_to'][layer_idx][
                                     head_idx] = top_k_tokens
@@ -1805,33 +1827,6 @@ class GPT(nn.Module):
             #    break
 
         if collect_info:
-            # Include initial context length in the generated_info
-            generated_info[0]['initial_context_length'] = initial_context_length
-            # Include attention_scores and token_norms in the generated_info
-            for idx_info, info in enumerate(generated_info):
-                info['attention_scores'] = attention_scores[idx_info]
-                info['token_norms'] = token_norms[idx_info]
-
-            # Compute total attention falling on each token per layer and head
-            for idx_info, info in enumerate(generated_info):
-                total_attention_per_layer_head = []
-                for layer_idx in range(num_layers):
-                    layer_total_attention = []
-                    for head_idx in range(num_heads):
-                        total_attention = sum(
-                            score for idx_from, score in
-                            info['attention_scores']['top_tokens_attending_to'][layer_idx][head_idx]
-                        )
-                        layer_total_attention.append(total_attention)
-                    total_attention_per_layer_head.append(layer_total_attention)
-                info['total_attention_per_layer_head'] = total_attention_per_layer_head
-
-            if collect_probs_per_layer:
-                return idx, generated_info, logits_per_layer_generated
-            else:
-                return idx, generated_info
+            return idx, next_token_probs_list, generated_info
         else:
-            if collect_probs_per_layer:
-                return idx, logits_per_layer_generated
-            else:
-                return idx, next_token_probs_list
+            return idx, next_token_probs_list
