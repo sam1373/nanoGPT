@@ -96,6 +96,9 @@ modded = False
 use_pseudo_flash = False
 pseudo_flash_chunk_size = 512
 do_lns = True
+local_window_size_groups = None
+local_window_size_min = None
+local_window_size_max = None
 
 precision = 'float32'
 
@@ -354,7 +357,10 @@ model_args = dict(
     modded=modded,
     use_pseudo_flash=use_pseudo_flash,
     pseudo_flash_chunk_size=pseudo_flash_chunk_size,
-    do_lns=do_lns
+    do_lns=do_lns,
+    local_window_size_groups=local_window_size_groups,
+    local_window_size_min=local_window_size_min,
+    local_window_size_max=local_window_size_max
 )
 if init_from == 'scratch':
     # init a new model from scratch
@@ -549,8 +555,12 @@ if master_process:
     print("softmax_like: %s" % (softmax_like))
     print("softmax_scale: %s" % (softmax_scale))
     print("modded: %s" % (modded))
+    print("local_window_size_groups: %s" % (local_window_size_groups))
+    print("local_window_size_min: %s" % (local_window_size_min))
+    print("local_window_size_max: %s" % (local_window_size_max))
     print("precision: %s" % (precision))
     print("batch_size: %f" % (batch_size))
+
 
 
 
@@ -596,6 +606,13 @@ if (use_nGPT == 1):
     normalize_matrices()
 
 while True:
+
+    #for layer_idx in range(0, config.n_layer):
+    #    block = transformer["h"][layer_idx].attn
+    #    print("layer_idx", layer_idx)
+    #    print("thr_c", block.thr_c)
+    #    print("stp", block.stp)
+
     if (1):
         local_seed = 100 * iter_num + seed_offset  # local_seed should never exceed 2.147e+9 because of np.random.seed, 100 here should be > nworkers
         np.random.seed(local_seed)
@@ -672,6 +689,8 @@ while True:
     optimizer.step()
     # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
+
+
 
     # timing and logging
     t1 = time.time()

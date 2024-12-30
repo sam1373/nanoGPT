@@ -10,6 +10,7 @@ References:
 import math
 import inspect
 from dataclasses import dataclass
+from optparse import Option
 
 import torch
 import torch.nn as nn
@@ -64,6 +65,9 @@ class CausalSelfAttention(nn.Module):
         self.score_threshold = config.score_threshold
         self.score_scale = config.score_scale
         self.layer_id = layer_id
+        self.local_window_size_groups = config.local_window_size_groups
+        self.local_window_size_min = config.local_window_size_min
+        self.local_window_size_max = config.local_window_size_max
 
         sqrt_head_dim = (self.config.n_embd / self.config.n_head) ** 0.5
 
@@ -304,19 +308,70 @@ class CausalSelfAttention(nn.Module):
 
             if self.training and self.local_heads_during_training > 0:
                 T = k.shape[2]
-                if self.local_heads_random:
-                    head_indices = torch.randperm(self.n_head)[:self.local_heads_during_training]
-                else:
-                    head_indices = torch.arange(self.local_heads_during_training, device=device)
-                local_heads_mask = torch.zeros(self.n_head, device=device, dtype=torch.bool)
-                local_heads_mask[head_indices] = True
+                device = k.device
 
-                i = torch.arange(T, device=device).view(-1, 1)
-                j = torch.arange(T, device=device).view(1, -1)
-                local_mask = (i - j >= self.local_window_size).bool()
-                local_mask = local_mask.unsqueeze(0).unsqueeze(0)
-                local_heads_mask_expanded = local_heads_mask.view(1, self.n_head, 1, 1)
-                attn = attn.masked_fill(local_heads_mask_expanded & local_mask, float('-inf'))
+                if self.local_window_size_groups is not None and len(self.local_window_size_groups) > 0:
+                    # Groups specified: assign per-group random window sizes
+
+                    # Select local heads as before
+                    if self.local_heads_random:
+                        head_indices = torch.randperm(self.n_head, device=device)[:self.local_heads_during_training]
+                    else:
+                        head_indices = torch.arange(self.local_heads_during_training, device=device)
+                    local_heads_mask = torch.zeros(self.n_head, device=device, dtype=torch.bool)
+                    local_heads_mask[head_indices] = True
+
+                    # Validate group parameters
+                    assert len(self.local_window_size_groups) == len(self.local_window_size_min) == len(
+                        self.local_window_size_max), \
+                        "local_window_size_groups, local_window_size_min, and local_window_size_max must have the same length."
+                    assert sum(self.local_window_size_groups) == self.local_heads_during_training, \
+                        "Sum of local_window_size_groups must equal local_heads_during_training."
+
+                    # Assign random window sizes per group
+                    per_head_window_sizes = torch.full((self.n_head,), T, device=device, dtype=torch.long)
+                    start_idx = 0
+                    for g_count, w_min, w_max in zip(self.local_window_size_groups, self.local_window_size_min,
+                                                     self.local_window_size_max):
+                        group_heads = head_indices[start_idx:start_idx + g_count]
+                        start_idx += g_count
+                        group_window_sizes = torch.randint(low=w_min, high=w_max + 1, size=(g_count,), device=device)
+                        print(g_count, w_min, w_max, group_window_sizes)
+                        per_head_window_sizes[group_heads] = group_window_sizes
+
+                    print(per_head_window_sizes)
+
+                    # Create masks per head
+                    i = torch.arange(T, device=device).view(-1, 1)
+                    j = torch.arange(T, device=device).view(1, -1)
+                    head_masks = torch.zeros((self.n_head, T, T), device=device, dtype=torch.bool)
+                    for h in range(self.n_head):
+                        if local_heads_mask[h]:
+                            w = per_head_window_sizes[h]
+                            head_masks[h] = (i - j >= w)
+
+                    head_masks = head_masks.unsqueeze(0)
+                    local_heads_mask_expanded = local_heads_mask.view(1, self.n_head, 1, 1)
+                    attn = attn.masked_fill(local_heads_mask_expanded & head_masks, float('-inf'))
+
+                else:
+                    # No groups: original behavior
+
+                    # Select local heads as in the original code
+                    if self.local_heads_random:
+                        head_indices = torch.randperm(self.n_head, device=device)[:self.local_heads_during_training]
+                    else:
+                        head_indices = torch.arange(self.local_heads_during_training, device=device)
+                    local_heads_mask = torch.zeros(self.n_head, device=device, dtype=torch.bool)
+                    local_heads_mask[head_indices] = True
+
+                    # Original local window masking
+                    i = torch.arange(T, device=device).view(-1, 1)
+                    j = torch.arange(T, device=device).view(1, -1)
+                    local_mask = (i - j >= self.local_window_size).bool()
+                    local_mask = local_mask.unsqueeze(0).unsqueeze(0)
+                    local_heads_mask_expanded = local_heads_mask.view(1, self.n_head, 1, 1)
+                    attn = attn.masked_fill(local_heads_mask_expanded & local_mask, float('-inf'))
 
             if self.config.score_scale is not None and self.config.score_scale != 1.0:
                 attn = torch.where(attn < self.config.score_threshold, attn * self.config.score_scale, attn)
@@ -1042,6 +1097,12 @@ class GPTConfig:
 
     local_heads_during_training: int = 0
     local_window_size: int = 128
+
+    local_window_size_min: List[int] = None
+    local_window_size_max: List[int] = None
+    local_window_size_groups: List[int] = None
+    #if we have groups, then use those for the local window size instead
+
     local_heads_random: bool = False
 
     top_p: float = 0.0
