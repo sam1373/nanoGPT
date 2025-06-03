@@ -25,7 +25,7 @@ CFG = dict(
     n_head=12,
     n_embd=768,
     dropout=0.0,
-    bias=False, 
+    bias=False,
     attention_type='full',
     nsa_block_size=64,
     nsa_topk=16,
@@ -52,9 +52,9 @@ CFG = dict(
     ruler_eval_max_new_tokens=10,
     ruler_verbose=False,
     model_dtype=('bf16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'fp16'),
-    enable_wandb=True,                    
-    wandb_run_name="my_default_run",      
-    wandb_project="my_default_project"     
+    enable_wandb=False,
+    wandb_run_name="my_default_run",
+    wandb_project="my_default_project"
 )
 
 parser = argparse.ArgumentParser()
@@ -114,7 +114,6 @@ DTYPE_MAP = {
 ptdtype = DTYPE_MAP[model_dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
-# Only initialize wandb if requested
 if master_process and enable_wandb:
     wandb.init(project=wandb_project, name=wandb_run_name)
 
@@ -179,6 +178,10 @@ if compile_model:
     model = torch.compile(model)
 if ddp:
     model = DDP(model, device_ids=[int(device.split(':')[-1])])
+    # expose custom methods
+    for fn in ("generate",):
+        if hasattr(model.module, fn):
+            setattr(model, fn, getattr(model.module, fn))
 
 tokenizer = tiktoken.get_encoding('gpt2')
 
