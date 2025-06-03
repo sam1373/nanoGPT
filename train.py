@@ -2,10 +2,14 @@ import os, time, math, pickle, json, glob, argparse
 from contextlib import nullcontext
 import numpy as np
 import torch
+import torch._dynamo
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed import init_process_group, destroy_process_group, all_reduce, ReduceOp
+from torch.distributed import init_process_group, destroy_process_group
 import tiktoken
 import wandb
+from model import GPTConfig, GPT
+
+torch._dynamo.config.capture_scalar_outputs = True
 
 CFG = dict(
     out_dir='out',
@@ -121,8 +125,8 @@ def get_batch(split):
     fn = 'train.bin' if split == 'train' else 'val.bin'
     data = np.memmap(os.path.join(data_dir, fn), dtype=np.uint16, mode='r')
     ix = torch.randint(len(data) - train_seq_length, (batch_size,))
-    x = torch.stack([torch.from_numpy(data[i:i + train_seq_length]).long() for i in ix])
-    y = torch.stack([torch.from_numpy(data[i + 1:i + 1 + train_seq_length]).long() for i in ix])
+    x = torch.stack([torch.from_numpy(data[i:i + train_seq_length].copy()).long() for i in ix])
+    y = torch.stack([torch.from_numpy(data[i + 1:i + 1 + train_seq_length].copy()).long() for i in ix])
     if device_type == 'cuda':
         x = x.pin_memory().to(device, non_blocking=True)
         y = y.pin_memory().to(device, non_blocking=True)
@@ -149,42 +153,32 @@ model_args = dict(
     model_dtype=model_dtype
 )
 
-from model import GPTConfig, GPT
-
-def latest_checkpoint(path):
-    pts = sorted(glob.glob(os.path.join(path, 'ckpt_*.pt')))
-    return pts[-1] if pts else None
-
-if init_from == 'scratch':
-    model = GPT(GPTConfig(**model_args))
-    iter_num = 0
-    best_val_loss = 1e9
-elif init_from == 'resume':
-    ckpt_path = latest_checkpoint(out_dir)
-    if ckpt_path is None:
-        ckpt_path = os.path.join(out_dir, 'ckpt_latest.pt')
-    ckpt = torch.load(ckpt_path, map_location='cpu')
+ckpt_files = sorted(glob.glob(os.path.join(out_dir, 'ckpt_iter*.pt')), key=os.path.getmtime)
+if init_from == 'resume' and ckpt_files:
+    last_ckpt = ckpt_files[-1]
+    ckpt = torch.load(last_ckpt, map_location='cpu')
     model_args.update(ckpt['model_args'])
     model = GPT(GPTConfig(**model_args))
     model.load_state_dict(ckpt['model'])
     iter_num = ckpt['iter_num']
     best_val_loss = ckpt['best_val_loss']
 else:
-    model = GPT.from_pretrained(init_from, dict(dropout=dropout))
+    if init_from == 'scratch':
+        model = GPT(GPTConfig(**model_args))
+    else:
+        model = GPT.from_pretrained(init_from, dict(dropout=dropout))
     iter_num = 0
     best_val_loss = 1e9
 
 model.to(device)
 checkpoint_model_args = model_args.copy()
 
-scaler = torch.cuda.amp.GradScaler(enabled=(model_dtype == 'fp16'))
+scaler = torch.amp.GradScaler('cuda', enabled=(model_dtype == 'fp16'))
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
-if init_from == 'resume':
+if init_from == 'resume' and ckpt_files:
     optimizer.load_state_dict(ckpt['optimizer'])
-
 if compile_model:
     model = torch.compile(model)
-
 if ddp:
     model = DDP(model, device_ids=[int(device.split(':')[-1])])
     for fn in ("generate",):
@@ -206,43 +200,36 @@ def estimate_loss():
     model.eval()
     out = {}
     for split in ('train', 'val'):
-        n_local = eval_iters // ddp_world_size
-        remainder = eval_iters % ddp_world_size
-        if ddp:
-            start = ddp_rank * n_local + min(ddp_rank, remainder)
-            n_local += 1 if ddp_rank < remainder else 0
-        else:
-            start = 0
-        losses = torch.zeros(n_local, device=device)
-        for i in range(n_local):
+        losses = torch.zeros(eval_iters, device=device)
+        for i in range(eval_iters):
             xb, yb = get_batch(split)
             with ctx:
                 _, loss, _ = model(xb, targets=yb)
             losses[i] = loss.item()
-        loss_sum = losses.sum()
         if ddp:
-            all_reduce(loss_sum, op=ReduceOp.SUM)
-        out[split] = (loss_sum.item() / eval_iters) if master_process else 0.0
+            torch.distributed.all_reduce(losses, op=torch.distributed.ReduceOp.SUM)
+            losses /= ddp_world_size
+        out[split] = losses.mean().item()
     model.train()
     return out
 
-def raw_model(m):
-    r = m.module if ddp else m
-    if hasattr(r, '_orig_mod'):
-        r = r._orig_mod
-    return r
-
 def save_ckpt():
-    raw = raw_model(model)
-    payload = {
+    raw = model.module if ddp else model
+    path = os.path.join(out_dir, f'ckpt_iter{iter_num}.pt')
+    torch.save({
         "model": raw.state_dict(),
         "optimizer": optimizer.state_dict(),
         "model_args": checkpoint_model_args,
         "iter_num": iter_num,
         "best_val_loss": best_val_loss
-    }
-    torch.save(payload, os.path.join(out_dir, f'ckpt_{iter_num:07d}.pt'))
-    torch.save(payload, os.path.join(out_dir, 'ckpt_latest.pt'))
+    }, path)
+    latest = os.path.join(out_dir, 'ckpt_latest.pt')
+    try:
+        if os.path.islink(latest) or os.path.exists(latest):
+            os.remove(latest)
+        os.symlink(os.path.basename(path), latest)
+    except OSError:
+        pass
 
 def load_ruler_tasks():
     tasks = {}
@@ -302,11 +289,7 @@ def eval_ruler(tasks, verbose=False):
             ok = any(t in gen for t in targets)
             if verbose:
                 short_prompt = prompt[-40:].replace('\n', ' ')
-                print(
-                    f'[{tname} #{i:02d}] …{short_prompt} '
-                    f'| pre:{pre_ms:6.1f} ms dec:{dec_ms:6.1f} ms '
-                    f'| gen:"{gen[:60]}" | exp:{targets} | {"✔" if ok else "✘"}'
-                )
+                print(f'[{tname} #{i:02d}] …{short_prompt} | pre:{pre_ms:6.1f} ms dec:{dec_ms:6.1f} ms | gen:"{gen[:60]}" | exp:{targets} | {"✔" if ok else "✘"}')
             correct += ok
             total += 1
         acc = 100 * correct / total if total else 0.0
@@ -327,33 +310,17 @@ while True:
         g['lr'] = lr_at(iter_num)
 
     if iter_num % eval_interval == 0 and master_process:
-        if device_type == 'cuda':
-            torch.cuda.synchronize(device)
-        t_eval_start = time.time()
         losses = estimate_loss()
-        if device_type == 'cuda':
-            torch.cuda.synchronize(device)
-        eval_ms = (time.time() - t_eval_start) * 1000
-        print(f"iter {iter_num}: train {losses['train']:.4f}, val {losses['val']:.4f}, eval {eval_ms:.1f} ms")
+        print(f"iter {iter_num}: train {losses['train']:.4f}, val {losses['val']:.4f}")
         if enable_wandb:
-            wandb.log({
-                "iter": iter_num,
-                "train_loss": losses['train'],
-                "val_loss": losses['val'],
-                "eval_ms": eval_ms
-            }, step=iter_num)
+            wandb.log({"iter": iter_num, "train_loss": losses['train'], "val_loss": losses['val']}, step=iter_num)
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             save_ckpt()
         if ruler_eval_enabled and iter_num % ruler_eval_interval == 0:
             ruler_metrics = eval_ruler(ruler_tasks, ruler_verbose)
             for tname, (acc, pre_ms, dec_ms, pre_token, dec_token) in ruler_metrics.items():
-                print(
-                    f"iter {iter_num} - {tname}: "
-                    f"RULER accuracy {acc:.2f}% | prefill {pre_ms:.1f} ms "
-                    f"| decode {dec_ms:.1f} ms | prefill/token {pre_token:.2f} ms "
-                    f"| decode/token {dec_token:.2f} ms"
-                )
+                print(f"iter {iter_num} - {tname}: RULER accuracy {acc:.2f}% | prefill {pre_ms:.1f} ms | decode {dec_ms:.1f} ms | prefill/token {pre_token:.2f} ms | decode/token {dec_token:.2f} ms")
                 if enable_wandb:
                     wandb.log({
                         f"ruler_accuracy_{tname}": acc,
@@ -386,11 +353,7 @@ while True:
         t0 = time.time()
         print(f"iter {iter_num}: loss {loss.item() * gradient_accumulation_steps:.4f}, {dt * 1000:.1f} ms")
         if enable_wandb:
-            wandb.log({
-                "iter": iter_num,
-                "loss": loss.item() * gradient_accumulation_steps,
-                "time_ms": dt * 1000
-            }, step=iter_num)
+            wandb.log({"iter": iter_num, "loss": loss.item() * gradient_accumulation_steps, "time_ms": dt * 1000}, step=iter_num)
 
     iter_num += 1
     if iter_num > max_iters:
