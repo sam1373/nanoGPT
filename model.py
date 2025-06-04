@@ -236,20 +236,11 @@ class NSAAttention(nn.Module):
 
             # build a fresh cache ONCE for all tokens
             new_cache = self._new_cache(B, x.device)
-
-            # do the "inference" path for the entire T in a single pass
-            # "step=0" for the entire chunk
-            # That means the kernel inside .inference() must handle T tokens
-            # as a single chunk. Just as your reference code "prefills" in one shot.
             self.nsa.inference(flat, cu, 0, new_cache)
 
             out = self.dropout(out)
             return out, new_cache
         else:
-            # incremental decode: T must be 1
-            if T != 1:
-                raise ValueError("NSA decode path expects a single token (T==1)")
-            # step = pos[0,0], or sometimes you pass step in separately
             step = int(pos[0, 0])
 
             out = self.nsa.inference(flat, cu, step, past)
@@ -408,4 +399,44 @@ class GPT(nn.Module):
 
     def get_num_params(self):
         return sum(p.numel() for p in self.parameters())
+
+
+    @classmethod
+    def from_pretrained(cls, init_from: str,
+                        override_args: dict | None = None,
+                        ckpt_name: str = "ckpt.pt"):
+        """
+        Re-implements the nanoGPT convenience loader.
+
+        Parameters
+        ----------
+        init_from      one of {"scratch", "resume"} or a path/to/ckpt.pt
+        override_args  dict of cfg overrides (e.g. {"dropout":0.1})
+        ckpt_name      filename to load when init_from == "resume"
+        """
+        override_args = override_args or {}
+
+        # ---- fresh model ---------------------------------------------------
+        if init_from == "scratch":
+            cfg = GPTConfig(**override_args)           # completely new config
+            return cls(cfg)
+
+        # ---- resume from training run --------------------------------------
+        import pathlib, torch, copy
+        if init_from == "resume":
+            ckpt_path = pathlib.Path(override_args.get("out_dir", ".")) / ckpt_name
+        else:
+            ckpt_path = pathlib.Path(init_from)         # explicit path or dir
+            if ckpt_path.is_dir():
+                ckpt_path = ckpt_path / ckpt_name
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"checkpoint not found: {ckpt_path}")
+
+        checkpoint   = torch.load(ckpt_path, map_location="cpu")
+        cfg_dict     = copy.deepcopy(checkpoint["model_args"])
+        cfg_dict.update(override_args)                  # let CLI overrides win
+        model        = cls(GPTConfig(**cfg_dict))
+        model.load_state_dict(checkpoint["model"], strict=False)
+        return model
+
 
