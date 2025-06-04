@@ -180,7 +180,7 @@ if init_from == 'resume' and ckpt_files:
 if compile_model:
     model = torch.compile(model)
 if ddp:
-    model = DDP(model, device_ids=[int(device.split(':')[-1])])
+    model = DDP(model, device_ids=[int(device.split(':')[-1])], bucket_cap_mb=32)
     for fn in ("generate",):
         if hasattr(model.module, fn):
             setattr(model, fn, getattr(model.module, fn))
@@ -303,6 +303,9 @@ def eval_ruler(tasks, verbose=False):
 
 ruler_tasks = load_ruler_tasks() if ruler_eval_enabled else {}
 print(f"tokens/iter: {tokens_per_iter:,}")
+
+
+torch.distributed.barrier()
 
 t0 = time.time()
 while True:
