@@ -1,4 +1,5 @@
-import os, time, math, pickle, json, glob, argparse
+import os
+import time, math, pickle, json, glob, argparse
 from contextlib import nullcontext
 import numpy as np
 import torch
@@ -8,6 +9,11 @@ from torch.distributed import init_process_group, destroy_process_group
 import tiktoken
 import wandb
 from model import GPTConfig, GPT
+
+# CRITICAL: Check that NCCL environment variables are set
+print("NCCL_TIMEOUT =", os.environ.get("NCCL_TIMEOUT"))
+print("NCCL_DEBUG =", os.environ.get("NCCL_DEBUG"))
+print("NCCL_BLOCKING_WAIT =", os.environ.get("NCCL_BLOCKING_WAIT"))
 
 torch._dynamo.config.capture_scalar_outputs = True
 
@@ -46,7 +52,7 @@ CFG = dict(
     min_lr=6e-5,
     backend='nccl',
     device='cuda',
-    compile_model=True,
+    compile_model=False,
     ruler_eval_enabled=False,
     ruler_eval_dir='data/ruler_tasks',
     ruler_eval_interval=100,
@@ -91,11 +97,13 @@ if ddp:
     if gradient_accumulation_steps % ddp_world_size:
         gradient_accumulation_steps //= ddp_world_size
         gradient_accumulation_steps = max(1, gradient_accumulation_steps)
+    print(f"Rank {ddp_rank}: Final gradient_accumulation_steps = {gradient_accumulation_steps}")
 else:
     master_process = True
     seed_offset = 0
     ddp_world_size = 1
     device = 'cuda'
+    print(f"Single GPU: gradient_accumulation_steps = {gradient_accumulation_steps}")
 
 tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * train_seq_length
 if master_process:
@@ -170,6 +178,7 @@ else:
     iter_num = 0
     best_val_loss = 1e9
 
+# Move model to device before DDP
 model.to(device)
 checkpoint_model_args = model_args.copy()
 
@@ -177,10 +186,20 @@ scaler = torch.amp.GradScaler('cuda', enabled=(model_dtype == 'fp16'))
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
 if init_from == 'resume' and ckpt_files:
     optimizer.load_state_dict(ckpt['optimizer'])
+
+# Compile model if requested (best practice: after .to(device), before DDP)
 if compile_model:
     model = torch.compile(model)
+
+# Wrap in DDP with small bucket size
 if ddp:
-    model = DDP(model, device_ids=[int(device.split(':')[-1])], bucket_cap_mb=32)
+    model = DDP(
+        model,
+        device_ids=[ddp_local_rank],
+        bucket_cap_mb=4,  # Keep buckets small to avoid stalls
+        broadcast_buffers=False
+    )
+    # Expose helper methods from the wrapped module
     for fn in ("generate",):
         if hasattr(model.module, fn):
             setattr(model, fn, getattr(model.module, fn))
@@ -304,8 +323,9 @@ def eval_ruler(tasks, verbose=False):
 ruler_tasks = load_ruler_tasks() if ruler_eval_enabled else {}
 print(f"tokens/iter: {tokens_per_iter:,}")
 
-
-torch.distributed.barrier()
+# Optional single barrier for debugging - remove once stable
+if ddp:
+    torch.distributed.barrier()
 
 t0 = time.time()
 while True:
@@ -364,4 +384,3 @@ while True:
 
 if ddp:
     destroy_process_group()
-
