@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-train.py  –  nanoGPT+NSA multi-GPU trainer
+train.py  –  nanoGPT+NSA multi-GPU trainer with W&B logging
 Fixes over baseline nanoGPT:
   • skip DDP collectives during single-rank loss eval
   • robust checkpoint-directory handling (no ckpts yet ⇒ start fresh)
-  • keep torch-dynamo graph-break flag but silence harmless warnings
-  • run RULER evaluation on *all* ranks to avoid NCCL watchdog timeouts
+  • silence benign Torch-Dynamo graph-break warnings
+  • run RULER evaluation on *all* ranks to avoid NCCL deadlock
+  • W&B metrics on master rank only
 """
 import os, time, math, pickle, json, glob, argparse
 from contextlib import nullcontext
@@ -15,7 +16,7 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 import tiktoken
-import wandb
+import wandb                          # <-- restored
 from model import GPTConfig, GPT
 
 # --------------------------------------------------------------------------
@@ -139,8 +140,11 @@ ptdtype   = DTYPE_MAP[model_dtype]
 ctx = nullcontext() if device == 'cpu' else torch.amp.autocast(device_type='cuda', dtype=ptdtype)
 tokenizer = tiktoken.get_encoding('gpt2')
 
+# ---- W&B ------------------------------------------------------------------
 if master_process and enable_wandb:
-    wandb.init(project=wandb_project, name=wandb_run_name)
+    wandb.init(project=wandb_project, name=wandb_run_name,
+               config={k: v for k, v in CFG.items()
+                       if isinstance(v, (int, float, str, bool))})
 
 data_dir = os.path.join('data', dataset)
 
@@ -180,8 +184,7 @@ model_args = dict(
 )
 
 ckpt_files = sorted(glob.glob(os.path.join(out_dir,'ckpt_iter*.pt')), key=os.path.getmtime)
-### FIX ❶ – tolerate empty checkpoint dir -----------------------------------
-have_ckpt = bool(ckpt_files) and init_from == 'resume'
+have_ckpt = bool(ckpt_files) and init_from == 'resume'      # FIX ❶
 
 if have_ckpt:
     last_ckpt = ckpt_files[-1]
@@ -217,27 +220,27 @@ if compile_model:
 
 if ddp:
     model = DDP(model, device_ids=[int(device.split(':')[-1])], bucket_cap_mb=32)
-    # expose generate() on the wrapper
     for fn in ('generate',):
         setattr(model, fn, getattr(model.module, fn))
 
-### FIX ❷ – object for inference convenience --------------------------------
-eval_model = model.module if ddp else model    # <- use inside eval_ruler()
+eval_model = model.module if ddp else model              # FIX ❷
 
 # --------------------------------------------------------------------------
 # 5.  helpers
 # --------------------------------------------------------------------------
 def lr_at(it):
-    if it < warmup_iters:                 # linear warm-up
+    if it < warmup_iters:
         return learning_rate * (it+1)/(warmup_iters+1)
-    if it > lr_decay_iters:               # floor
+    if it > lr_decay_iters:
         return min_lr
     r = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
     return min_lr + 0.5*(1+math.cos(math.pi*r))*(learning_rate - min_lr)
 
+def throughput(num_tokens, seconds):
+    return (num_tokens / seconds) if seconds > 0 else 0.0
+
 @torch.no_grad()
 def estimate_loss():
-    """Per-rank loss estimate -> averaged across world."""
     eval_model.eval()
     out = {}
     for split in ('train','val'):
@@ -273,12 +276,11 @@ def load_ruler_tasks():
 
 @torch.no_grad()
 def eval_ruler(tasks, verbose=False):
-    """Run on every rank; verbose print only on master."""
     eval_model.eval()
     results = {}
     for tname, samples in tasks.items():
         correct = total = 0
-        pre_ms = dec_ms = pre_tok = dec_tok = 0.0
+        pre_ms = dec_ms = 0.0
         for s in samples:
             prompt  = s['input']
             targets = list(map(str, s['outputs']))
@@ -286,14 +288,13 @@ def eval_ruler(tasks, verbose=False):
                                    device=device).unsqueeze(0)
             pl      = idx.size(1)
             torch.cuda.synchronize(device); t0 = time.time()
-            with ctx: _ = eval_model(idx)         # pre-fill
+            with ctx: _ = eval_model(idx)
             torch.cuda.synchronize(device); t1 = time.time()
             with ctx:
                 out = eval_model.generate(idx, ruler_eval_max_new_tokens,
                                           temp=0.1, top_k=1)
             torch.cuda.synchronize(device); t2 = time.time()
             pre_ms  += (t1-t0)*1e3;  dec_ms += (t2-t1)*1e3
-            pre_tok += pre_ms/pl;    dec_tok += dec_ms/(out.size(1)-pl)
             gen = tokenizer.decode(out[0].tolist())[len(prompt):]
             correct += any(t in gen for t in targets);  total += 1
             if verbose:
@@ -301,9 +302,7 @@ def eval_ruler(tasks, verbose=False):
                 print(f"[{tname}] …{short} | gen:\"{gen[:60]}\" "
                       f"| ok:{correct}/{total}")
         if total:
-            results[tname] = (100*correct/total,
-                              pre_ms/total, dec_ms/total,
-                              pre_tok/total, dec_tok/total)
+            results[tname] = 100*correct/total
     eval_model.train()
     return results
 
@@ -312,31 +311,38 @@ ruler_tasks = load_ruler_tasks() if ruler_eval_enabled else {}
 # --------------------------------------------------------------------------
 # 6.  training loop
 # --------------------------------------------------------------------------
-t0 = time.time()
+t0 = time.time()                # last log-time
+toks_since_log = 0
 while True:
-    # learning-rate scheduler
     lr = lr_at(iter_num)
     for g in optimizer.param_groups:
         g['lr'] = lr
 
     # ---- evaluation ------------------------------------------------------
     if iter_num % eval_interval == 0:
-        if ddp: torch.distributed.barrier()       # sync before eval
-
+        if ddp: torch.distributed.barrier()
         losses = estimate_loss()
 
-        # ---------- RULER (run on every rank) ------------------------------
+        # RULER on every rank
+        ruler_results = {}
         if ruler_eval_enabled and iter_num % ruler_eval_interval == 0:
-            ruler_metrics = eval_ruler(ruler_tasks,
+            ruler_results = eval_ruler(ruler_tasks,
                                        ruler_verbose and master_process)
-            if master_process:
-                for tn,(acc,p,d,pt,dt) in ruler_metrics.items():
-                    print(f"iter {iter_num} - {tn}: "
-                          f"acc {acc:.2f}% | pre {p:.1f} ms | dec {d:.1f} ms")
 
         if master_process:
             print(f"iter {iter_num}: train {losses['train']:.4f}, "
                   f"val {losses['val']:.4f}")
+            if enable_wandb:
+                log_dict = {
+                    'iter':        iter_num,
+                    'train/loss':  losses['train'],
+                    'val/loss':    losses['val'],
+                    'lr':          lr,
+                }
+                for k, v in ruler_results.items():
+                    log_dict[f"ruler/{k}"] = v
+                wandb.log(log_dict)
+
             if losses['val'] < best_val_loss or always_save_checkpoint:
                 best_val_loss = losses['val']
                 raw = model.module if ddp else model
@@ -346,7 +352,7 @@ while True:
                             'iter_num':   iter_num,
                             'best_val_loss': best_val_loss},
                            os.path.join(out_dir, f'ckpt_iter{iter_num}.pt'))
-        if ddp: torch.distributed.barrier()       # sync after eval
+        if ddp: torch.distributed.barrier()
 
     if eval_only and iter_num == 0:
         break
@@ -369,13 +375,24 @@ while True:
     optimizer.zero_grad(set_to_none=True)
 
     # ---- logging ---------------------------------------------------------
+    toks_since_log += batch_size * train_seq_length * ddp_world_size
     if master_process and iter_num % log_interval == 0:
-        dt = time.time() - t0;  t0 = time.time()
+        dt = time.time() - t0
         print(f"iter {iter_num}: loss {loss.item()*gradient_accumulation_steps:.4f}, "
-              f"{dt*1e3:.1f} ms, lr {lr:.2e}")
+              f"{dt*1e3:.1f} ms, lr {lr:.2e}, "
+              f"{throughput(toks_since_log, dt):.1f} tok/s")
+        if enable_wandb:
+            wandb.log({'iter': iter_num,
+                       'train/loss_step': loss.item()*gradient_accumulation_steps,
+                       'tok_per_sec': throughput(toks_since_log, dt)})
+        t0 = time.time()
+        toks_since_log = 0
 
     iter_num += 1
-    if iter_num > max_iters: break
+    if iter_num > max_iters:
+        break
 
 destroy_process_group() if ddp else None
+if master_process and enable_wandb:
+    wandb.finish()
 
