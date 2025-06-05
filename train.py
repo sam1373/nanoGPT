@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-train.py  –  nanoGPT+NSA multi‑GPU trainer (patched)
-
-Key fixes (see README.md for details):
-  • Rank‑synchronised RULER evaluation (single barrier before & after).
-  • DDP created with static_graph=True → removes rebuild_buckets() broadcast.
-  • Longer distributed timeout (60 min) & clean NCCL env‑vars.
-  • Optional InfiniBand plugin is disabled for single‑node jobs to avoid hangs.
-  • Robust checkpoint handling + torch‑dynamo scalar capture as before.
+train.py  –  nanoGPT+NSA multi-GPU trainer
+Fixes over baseline nanoGPT:
+  • skip DDP collectives during single-rank loss eval
+  • robust checkpoint-directory handling (no ckpts yet ⇒ start fresh)
+  • keep torch-dynamo graph-break flag but silence harmless warnings
+  • run RULER evaluation on *all* ranks to avoid NCCL watchdog timeouts
 """
-
-import os, time, math, pickle, json, glob, argparse, datetime
+import os, time, math, pickle, json, glob, argparse
 from contextlib import nullcontext
 import numpy as np
 import torch
@@ -22,20 +19,12 @@ import wandb
 from model import GPTConfig, GPT
 
 # --------------------------------------------------------------------------
-# 0.  environment hardening before *anything* touches NCCL -----------------
-# --------------------------------------------------------------------------
-os.environ.pop("NCCL_BLOCKING_WAIT", None)              # deprecated
-os.environ["TORCH_NCCL_BLOCKING_WAIT"] = "1"
-os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "1"
-# Disable the buggy IBext RDMA plugin for on‑node training (kept overridable)
-os.environ.setdefault("NCCL_NET", "^IBEXT")
-
-# --------------------------------------------------------------------------
-# 1.  configuration & CLI --------------------------------------------------
+# 0.  configuration & CLI
 # --------------------------------------------------------------------------
 torch._dynamo.config.capture_scalar_outputs = True   # keep graphs whole
 
 CFG = dict(
+    # I/O --------------------------------------------------------------
     out_dir                   = 'out',
     eval_interval             = 1_000,
     log_interval              =   50,
@@ -44,9 +33,11 @@ CFG = dict(
     always_save_checkpoint    = True,
     init_from                 = 'scratch',           # scratch | resume | dir/ckpt.pt
     dataset                   = 'openwebtext',
+    # batching ---------------------------------------------------------
     batch_size                = 12,
     gradient_accumulation_steps = 1,
     train_seq_length          = 1024,
+    # model spec -------------------------------------------------------
     n_layer                   =   12,
     n_head                    =   12,
     n_embd                    =  768,
@@ -58,6 +49,7 @@ CFG = dict(
     nsa_num_kv_heads          = -1,
     nsa_window_size           = 512,
     nsa_local_blocks          = 4,
+    # optimiser --------------------------------------------------------
     learning_rate             = 6e-4,
     weight_decay              = 1e-1,
     beta1                     = 0.9,
@@ -68,17 +60,18 @@ CFG = dict(
     warmup_iters              = 2_000,
     lr_decay_iters            = 600_000,
     min_lr                    = 6e-5,
+    # system -----------------------------------------------------------
     backend                   = 'nccl',
     device                    = 'cuda',
     compile_model             = False,
-    # --- RULER ------------------------------------------------------------
+    # --- RULER --------------------------------------------------------
     ruler_eval_enabled        = False,
     ruler_eval_dir            = 'data/ruler_tasks',
     ruler_eval_interval       = 100,
     ruler_samples_per_task    = 10,
     ruler_eval_max_new_tokens = 10,
     ruler_verbose             = False,
-    # ---------------------------------------------------------------------
+    # -----------------------------------------------------------------
     model_dtype               = ('bf16' if torch.cuda.is_available()
                                          and torch.cuda.is_bf16_supported()
                                else 'fp16'),
@@ -100,7 +93,7 @@ CFG.update(vars(parser.parse_args()))
 globals().update(CFG)
 
 # --------------------------------------------------------------------------
-# 2.  distributed bootstrap ------------------------------------------------
+# 1.  distributed bootstrap
 # --------------------------------------------------------------------------
 use_slurm = os.getenv('SLURM_JOB_ID') is not None
 if use_slurm:
@@ -110,12 +103,9 @@ if use_slurm:
     os.environ.setdefault('MASTER_ADDR', os.getenv('SLURM_NODELIST','').split(',')[0].split('(')[0])
     os.environ.setdefault('MASTER_PORT', '12910')
 
-# Longer watchdog timeout so big eval blocks don’t fire it
-DDP_TIMEOUT = datetime.timedelta(minutes=60)
-
 ddp = int(os.getenv('RANK', -1)) != -1
 if ddp:
-    init_process_group(backend=backend, timeout=DDP_TIMEOUT)
+    init_process_group(backend=backend)
     ddp_rank        = int(os.environ['RANK'])
     ddp_local_rank  = int(os.environ['LOCAL_RANK'])
     ddp_world_size  = int(os.environ['WORLD_SIZE'])
@@ -139,7 +129,7 @@ if master_process:
     print(f"tokens/iter: {tokens_per_iter:,}")
 
 # --------------------------------------------------------------------------
-# 3.  misc setup -----------------------------------------------------------
+# 2.  misc setup
 # --------------------------------------------------------------------------
 torch.manual_seed(1337 + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -147,12 +137,7 @@ torch.backends.cudnn.allow_tf32       = True
 DTYPE_MAP = {'fp32':torch.float32,'bf16':torch.bfloat16,'fp16':torch.float16}
 ptdtype   = DTYPE_MAP[model_dtype]
 ctx = nullcontext() if device == 'cpu' else torch.amp.autocast(device_type='cuda', dtype=ptdtype)
-
-# Tokeniser ---------------------------------------------------------------
-try:
-    tokenizer = tiktoken.get_encoding('gpt2')
-except Exception:
-    raise RuntimeError("tiktoken not found or GPT‑2 encoding unavailable – install tiktoken >=0.5.1")
+tokenizer = tiktoken.get_encoding('gpt2')
 
 if master_process and enable_wandb:
     wandb.init(project=wandb_project, name=wandb_run_name)
@@ -160,11 +145,10 @@ if master_process and enable_wandb:
 data_dir = os.path.join('data', dataset)
 
 # --------------------------------------------------------------------------
-# 4.  data loader ----------------------------------------------------------
+# 3.  data loader
 # --------------------------------------------------------------------------
 train_memmap = np.memmap(os.path.join(data_dir,'train.bin'),dtype=np.uint16,mode='r')
 val_memmap   = np.memmap(os.path.join(data_dir,'val.bin'  ),dtype=np.uint16,mode='r')
-
 def get_batch(split):
     data = train_memmap if split == 'train' else val_memmap
     ix   = torch.randint(len(data) - train_seq_length, (batch_size,))
@@ -178,7 +162,7 @@ def get_batch(split):
     return x, y
 
 # --------------------------------------------------------------------------
-# 5.  model & optimiser ----------------------------------------------------
+# 4.  model & optimiser
 # --------------------------------------------------------------------------
 meta_vocab_size = None
 meta_path = os.path.join(data_dir, 'meta.pkl')
@@ -196,6 +180,7 @@ model_args = dict(
 )
 
 ckpt_files = sorted(glob.glob(os.path.join(out_dir,'ckpt_iter*.pt')), key=os.path.getmtime)
+### FIX ❶ – tolerate empty checkpoint dir -----------------------------------
 have_ckpt = bool(ckpt_files) and init_from == 'resume'
 
 if have_ckpt:
@@ -230,25 +215,18 @@ if have_ckpt:
 if compile_model:
     model = torch.compile(model)
 
-# Distributed wrapper ------------------------------------------------------
 if ddp:
-    model = DDP(
-        model,
-        device_ids=[int(device.split(':')[-1])],
-        bucket_cap_mb=32,
-        static_graph=True        # <- remove rebuild_buckets() broadcast
-    )
+    model = DDP(model, device_ids=[int(device.split(':')[-1])], bucket_cap_mb=32)
     # expose generate() on the wrapper
     for fn in ('generate',):
         setattr(model, fn, getattr(model.module, fn))
 
-# Object for *single-rank* inference (no DDP collectives)
-eval_model = model.module if ddp else model
+### FIX ❷ – object for inference convenience --------------------------------
+eval_model = model.module if ddp else model    # <- use inside eval_ruler()
 
 # --------------------------------------------------------------------------
-# 6.  helpers --------------------------------------------------------------
+# 5.  helpers
 # --------------------------------------------------------------------------
-
 def lr_at(it):
     if it < warmup_iters:                 # linear warm-up
         return learning_rate * (it+1)/(warmup_iters+1)
@@ -259,7 +237,7 @@ def lr_at(it):
 
 @torch.no_grad()
 def estimate_loss():
-    """Per-rank loss estimate -> world averaged."""
+    """Per-rank loss estimate -> averaged across world."""
     eval_model.eval()
     out = {}
     for split in ('train','val'):
@@ -276,8 +254,7 @@ def estimate_loss():
     eval_model.train()
     return out
 
-# ---------------- RULER ---------------------------------------------------
-
+# ---------------- RULER ----------------------------------------------------
 def load_ruler_tasks():
     tasks = {}
     if not os.path.isdir(ruler_eval_dir):
@@ -296,7 +273,7 @@ def load_ruler_tasks():
 
 @torch.no_grad()
 def eval_ruler(tasks, verbose=False):
-    """Single-rank evaluation; use *eval_model*, no collectives."""
+    """Run on every rank; verbose print only on master."""
     eval_model.eval()
     results = {}
     for tname, samples in tasks.items():
@@ -309,8 +286,7 @@ def eval_ruler(tasks, verbose=False):
                                    device=device).unsqueeze(0)
             pl      = idx.size(1)
             torch.cuda.synchronize(device); t0 = time.time()
-            with ctx:
-                _ = eval_model(idx)                # pre-fill
+            with ctx: _ = eval_model(idx)         # pre-fill
             torch.cuda.synchronize(device); t1 = time.time()
             with ctx:
                 out = eval_model.generate(idx, ruler_eval_max_new_tokens,
@@ -320,9 +296,10 @@ def eval_ruler(tasks, verbose=False):
             pre_tok += pre_ms/pl;    dec_tok += dec_ms/(out.size(1)-pl)
             gen = tokenizer.decode(out[0].tolist())[len(prompt):]
             correct += any(t in gen for t in targets);  total += 1
-            if verbose and master_process:
+            if verbose:
                 short = prompt[-40:].replace('\n',' ')
-                print(f"[{tname}] …{short} | gen:\"{gen[:60]}\" | ok:{correct}/{total}")
+                print(f"[{tname}] …{short} | gen:\"{gen[:60]}\" "
+                      f"| ok:{correct}/{total}")
         if total:
             results[tname] = (100*correct/total,
                               pre_ms/total, dec_ms/total,
@@ -333,24 +310,33 @@ def eval_ruler(tasks, verbose=False):
 ruler_tasks = load_ruler_tasks() if ruler_eval_enabled else {}
 
 # --------------------------------------------------------------------------
-# 7.  training loop --------------------------------------------------------
+# 6.  training loop
 # --------------------------------------------------------------------------
-
 t0 = time.time()
 while True:
-    # learning‑rate scheduler
+    # learning-rate scheduler
     lr = lr_at(iter_num)
     for g in optimizer.param_groups:
         g['lr'] = lr
 
     # ---- evaluation ------------------------------------------------------
     if iter_num % eval_interval == 0:
-        if ddp:
-            torch.distributed.barrier()       # sync before eval
-        # losses on *all* ranks
+        if ddp: torch.distributed.barrier()       # sync before eval
+
         losses = estimate_loss()
+
+        # ---------- RULER (run on every rank) ------------------------------
+        if ruler_eval_enabled and iter_num % ruler_eval_interval == 0:
+            ruler_metrics = eval_ruler(ruler_tasks,
+                                       ruler_verbose and master_process)
+            if master_process:
+                for tn,(acc,p,d,pt,dt) in ruler_metrics.items():
+                    print(f"iter {iter_num} - {tn}: "
+                          f"acc {acc:.2f}% | pre {p:.1f} ms | dec {d:.1f} ms")
+
         if master_process:
-            print(f"iter {iter_num}: train {losses['train']:.4f}, val {losses['val']:.4f}")
+            print(f"iter {iter_num}: train {losses['train']:.4f}, "
+                  f"val {losses['val']:.4f}")
             if losses['val'] < best_val_loss or always_save_checkpoint:
                 best_val_loss = losses['val']
                 raw = model.module if ddp else model
@@ -360,13 +346,7 @@ while True:
                             'iter_num':   iter_num,
                             'best_val_loss': best_val_loss},
                            os.path.join(out_dir, f'ckpt_iter{iter_num}.pt'))
-            # ---- RULER on rank 0 only -----------------------------------
-            if ruler_eval_enabled and iter_num % ruler_eval_interval == 0:
-                ruler_metrics = eval_ruler(ruler_tasks, ruler_verbose)
-                for tn,(acc,p,d,pt,dt) in ruler_metrics.items():
-                    print(f"iter {iter_num} - {tn}: acc {acc:.2f}% | pre {p:.1f} ms | dec {d:.1f} ms")
-        if ddp:
-            torch.distributed.barrier()       # sync after eval
+        if ddp: torch.distributed.barrier()       # sync after eval
 
     if eval_only and iter_num == 0:
         break
@@ -391,12 +371,11 @@ while True:
     # ---- logging ---------------------------------------------------------
     if master_process and iter_num % log_interval == 0:
         dt = time.time() - t0;  t0 = time.time()
-        print(f"iter {iter_num}: loss {loss.item()*gradient_accumulation_steps:.4f}, {dt*1e3:.1f} ms, lr {lr:.2e}")
+        print(f"iter {iter_num}: loss {loss.item()*gradient_accumulation_steps:.4f}, "
+              f"{dt*1e3:.1f} ms, lr {lr:.2e}")
 
     iter_num += 1
-    if iter_num > max_iters:
-        break
+    if iter_num > max_iters: break
 
-if ddp:
-    destroy_process_group()
+destroy_process_group() if ddp else None
 
