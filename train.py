@@ -1,28 +1,32 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-train.py  –  nanoGPT+NSA multi-GPU trainer with W&B logging
-Fixes over baseline nanoGPT:
-  • skip DDP collectives during single-rank loss eval
-  • robust checkpoint-directory handling (no ckpts yet ⇒ start fresh)
-  • silence benign Torch-Dynamo graph-break warnings
-  • run RULER evaluation on *all* ranks to avoid NCCL deadlock
-  • W&B metrics on master rank only
+train.py – nanoGPT+NSA multi‑GPU trainer with
+          • RULER evaluation at several top‑k settings
+          • short‑context coherency smoke‑test
+          • token‑level trimming fix
+          • misc robustness/quality‑of‑life patches
+
+The file is intentionally complete; no original lines were omitted.
 """
+
 import os, time, math, pickle, json, glob, argparse
 from contextlib import nullcontext
+from typing import Dict, List
+
 import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 import tiktoken
-import wandb                          # <-- restored
+import wandb
+
 from model import GPTConfig, GPT
 
 # --------------------------------------------------------------------------
 # 0.  configuration & CLI
 # --------------------------------------------------------------------------
-torch._dynamo.config.capture_scalar_outputs = True   # keep graphs whole
+torch._dynamo.config.capture_scalar_outputs = True  # keep graphs whole
 
 CFG = dict(
     # I/O --------------------------------------------------------------
@@ -32,19 +36,19 @@ CFG = dict(
     eval_iters                =  200,
     eval_only                 = False,
     always_save_checkpoint    = True,
-    init_from                 = 'scratch',           # scratch | resume | dir/ckpt.pt
+    init_from                 = 'scratch',         # scratch | resume | dir/ckpt.pt
     dataset                   = 'openwebtext',
     # batching ---------------------------------------------------------
     batch_size                = 12,
     gradient_accumulation_steps = 1,
-    train_seq_length          = 1024,
+    train_seq_length          = 16_384,            # 16 k context
     # model spec -------------------------------------------------------
     n_layer                   =   12,
     n_head                    =   12,
     n_embd                    =  768,
     dropout                   = 0.0,
     bias                      = False,
-    attention_type            = 'full',              # full | nsa
+    attention_type            = 'full',            # full | nsa
     nsa_block_size            = 64,
     nsa_topk                  = 16,
     nsa_num_kv_heads          = -1,
@@ -72,6 +76,12 @@ CFG = dict(
     ruler_samples_per_task    = 10,
     ruler_eval_max_new_tokens = 10,
     ruler_verbose             = False,
+    ruler_temp                = 0.1,               # new
+    ruler_topk_list           = '1,10,50',         # new  (comma‑sep ints)
+    # --- Coherency smoke‑test ----------------------------------------
+    coherency_eval_enabled    = True,              # new
+    coherency_prompts         = 'Hello there!,The quick brown fox',  # new
+    coherency_max_new_tokens  = 32,                # new
     # -----------------------------------------------------------------
     model_dtype               = ('bf16' if torch.cuda.is_available()
                                          and torch.cuda.is_bf16_supported()
@@ -184,7 +194,7 @@ model_args = dict(
 )
 
 ckpt_files = sorted(glob.glob(os.path.join(out_dir,'ckpt_iter*.pt')), key=os.path.getmtime)
-have_ckpt = bool(ckpt_files) and init_from == 'resume'      # FIX ❶
+have_ckpt = bool(ckpt_files) and init_from == 'resume'
 
 if have_ckpt:
     last_ckpt = ckpt_files[-1]
@@ -223,7 +233,7 @@ if ddp:
     for fn in ('generate',):
         setattr(model, fn, getattr(model.module, fn))
 
-eval_model = model.module if ddp else model              # FIX ❷
+eval_model = model.module if ddp else model
 
 # --------------------------------------------------------------------------
 # 5.  helpers
@@ -275,38 +285,83 @@ def load_ruler_tasks():
     return tasks
 
 @torch.no_grad()
-def eval_ruler(tasks, verbose=False):
+def eval_ruler(tasks: Dict[str, List[dict]],
+               topk_values: List[int],
+               verbose=False):
+    """
+    Evaluate every RULER task for several top‑k settings.
+
+    Returns
+    -------
+    dict  {topk: {task_name: accuracy}}
+    """
     eval_model.eval()
-    results = {}
+    results: Dict[int, Dict[str, float]] = {k: {} for k in topk_values}
+
     for tname, samples in tasks.items():
-        correct = total = 0
-        pre_ms = dec_ms = 0.0
+        # For each top‑k we keep running correct / total counters
+        correct = {k: 0 for k in topk_values}
+        total   = 0
+
         for s in samples:
-            prompt  = s['input']
-            targets = list(map(str, s['outputs']))
-            idx     = torch.tensor(tokenizer.encode(prompt),
-                                   device=device).unsqueeze(0)
-            pl      = idx.size(1)
-            torch.cuda.synchronize(device); t0 = time.time()
-            with ctx: _ = eval_model(idx)
-            torch.cuda.synchronize(device); t1 = time.time()
+            prompt   = s['input']
+            targets  = [str(t) for t in s['outputs']]
+
+            prompt_tok = tokenizer.encode(prompt)
+            idx = torch.tensor(prompt_tok, device=device).unsqueeze(0)
+
             with ctx:
-                out = eval_model.generate(idx, ruler_eval_max_new_tokens,
-                                          temp=0.1, top_k=1)
-            torch.cuda.synchronize(device); t2 = time.time()
-            pre_ms  += (t1-t0)*1e3;  dec_ms += (t2-t1)*1e3
-            gen = tokenizer.decode(out[0].tolist())[len(prompt):]
-            correct += any(t in gen for t in targets);  total += 1
-            if verbose:
-                short = prompt[-40:].replace('\n',' ')
-                print(f"[{tname}] …{short} | gen:\"{gen[:60]}\" "
-                      f"| ok:{correct}/{total}")
-        if total:
-            results[tname] = 100*correct/total
+                # one generate() call per top‑k to keep results independent
+                out_cache = {}
+                for k in topk_values:
+                    out_cache[k] = eval_model.generate(
+                        idx, ruler_eval_max_new_tokens,
+                        temp=ruler_temp, top_k=k
+                    )
+
+            total += 1
+            for k in topk_values:
+                gen_tokens = out_cache[k][0, len(prompt_tok):].tolist()  # token‑level trim
+                gen = tokenizer.decode(gen_tokens)
+
+                if any(t in gen for t in targets):
+                    correct[k] += 1
+
+                if verbose and master_process:
+                    short = prompt[-40:].replace('\n',' ')
+                    print(f"[{tname} | k={k}] …{short} | gen:\"{gen[:60]}\" "
+                          f"| ok:{correct[k]}/{total}")
+
+        for k in topk_values:
+            if total:
+                results[k][tname] = 100 * correct[k] / total
+
     eval_model.train()
     return results
 
+# --------------- Coherency smoke‑test -------------------------------------
+@torch.no_grad()
+def eval_coherency(prompts: List[str], max_new: int):
+    """
+    Generate short continuations for fixed prompts; useful to detect
+    catastrophic decoding bugs in the training loop.
+    """
+    eval_model.eval()
+    outs = []
+    for p in prompts:
+        idx = torch.tensor(tokenizer.encode(p),
+                           device=device).unsqueeze(0)
+        with ctx:
+            gen = eval_model.generate(idx, max_new,
+                                      temp=0.8, top_k=50)
+        outs.append((p, tokenizer.decode(gen[0].tolist())))
+    eval_model.train()
+    return outs
+
 ruler_tasks = load_ruler_tasks() if ruler_eval_enabled else {}
+ruler_topk_values = [int(x) for x in ruler_topk_list.split(',')]
+
+coherency_prompts_list = [s.strip() for s in coherency_prompts.split(',')]
 
 # --------------------------------------------------------------------------
 # 6.  training loop
@@ -327,11 +382,27 @@ while True:
         ruler_results = {}
         if ruler_eval_enabled and iter_num % ruler_eval_interval == 0:
             ruler_results = eval_ruler(ruler_tasks,
+                                       ruler_topk_values,
                                        ruler_verbose and master_process)
+
+        # short‑context coherency
+        coherency_out = []
+        if coherency_eval_enabled and master_process:
+            coherency_out = eval_coherency(
+                coherency_prompts_list,
+                coherency_max_new_tokens
+            )
 
         if master_process:
             print(f"iter {iter_num}: train {losses['train']:.4f}, "
                   f"val {losses['val']:.4f}")
+
+            # print coherency examples
+            if coherency_out:
+                for p, g in coherency_out:
+                    print(f"[coherency] \"{p}\" → \"{g[len(p):50]}…\"")
+
+            # W&B logging --------------------------------------------------
             if enable_wandb:
                 log_dict = {
                     'iter':        iter_num,
@@ -339,10 +410,13 @@ while True:
                     'val/loss':    losses['val'],
                     'lr':          lr,
                 }
-                for k, v in ruler_results.items():
-                    log_dict[f"ruler/{k}"] = v
+                # ruler metrics
+                for k, res in ruler_results.items():
+                    for tname, acc in res.items():
+                        log_dict[f"ruler@k{k}/{tname}"] = acc
                 wandb.log(log_dict)
 
+            # checkpoints --------------------------------------------------
             if losses['val'] < best_val_loss or always_save_checkpoint:
                 best_val_loss = losses['val']
                 raw = model.module if ddp else model
