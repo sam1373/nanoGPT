@@ -4,10 +4,10 @@
 train.py – nanoGPT+NSA multi‑GPU trainer with
           • RULER evaluation at several top‑k settings
           • short‑context coherency smoke‑test
-          • token‑level trimming fix
-          • misc robustness/quality‑of‑life patches
+          • token‑level trimming everywhere
+          • miscellaneous robustness fixes
 
-The file is intentionally complete; no original lines were omitted.
+The file is intentionally complete; no lines are omitted.
 """
 
 import os, time, math, pickle, json, glob, argparse
@@ -41,7 +41,7 @@ CFG = dict(
     # batching ---------------------------------------------------------
     batch_size                = 12,
     gradient_accumulation_steps = 1,
-    train_seq_length          = 16_384,            # 16 k context
+    train_seq_length          = 1024,              # original default
     # model spec -------------------------------------------------------
     n_layer                   =   12,
     n_head                    =   12,
@@ -76,12 +76,12 @@ CFG = dict(
     ruler_samples_per_task    = 10,
     ruler_eval_max_new_tokens = 10,
     ruler_verbose             = False,
-    ruler_temp                = 0.1,               # new
-    ruler_topk_list           = '1,10,50',         # new  (comma‑sep ints)
+    ruler_temp                = 0.1,
+    ruler_topk_list           = '1,10,50',
     # --- Coherency smoke‑test ----------------------------------------
-    coherency_eval_enabled    = True,              # new
-    coherency_prompts         = 'Hello there!,The quick brown fox',  # new
-    coherency_max_new_tokens  = 32,                # new
+    coherency_eval_enabled    = True,
+    coherency_prompts         = 'Hello there!,The quick brown fox',
+    coherency_max_new_tokens  = 32,
     # -----------------------------------------------------------------
     model_dtype               = ('bf16' if torch.cuda.is_available()
                                          and torch.cuda.is_bf16_supported()
@@ -288,18 +288,10 @@ def load_ruler_tasks():
 def eval_ruler(tasks: Dict[str, List[dict]],
                topk_values: List[int],
                verbose=False):
-    """
-    Evaluate every RULER task for several top‑k settings.
-
-    Returns
-    -------
-    dict  {topk: {task_name: accuracy}}
-    """
     eval_model.eval()
     results: Dict[int, Dict[str, float]] = {k: {} for k in topk_values}
 
     for tname, samples in tasks.items():
-        # For each top‑k we keep running correct / total counters
         correct = {k: 0 for k in topk_values}
         total   = 0
 
@@ -311,7 +303,6 @@ def eval_ruler(tasks: Dict[str, List[dict]],
             idx = torch.tensor(prompt_tok, device=device).unsqueeze(0)
 
             with ctx:
-                # one generate() call per top‑k to keep results independent
                 out_cache = {}
                 for k in topk_values:
                     out_cache[k] = eval_model.generate(
@@ -323,7 +314,6 @@ def eval_ruler(tasks: Dict[str, List[dict]],
             for k in topk_values:
                 gen_tokens = out_cache[k][0, len(prompt_tok):].tolist()  # token‑level trim
                 gen = tokenizer.decode(gen_tokens)
-
                 if any(t in gen for t in targets):
                     correct[k] += 1
 
@@ -349,18 +339,19 @@ def eval_coherency(prompts: List[str], max_new: int):
     eval_model.eval()
     outs = []
     for p in prompts:
-        idx = torch.tensor(tokenizer.encode(p),
-                           device=device).unsqueeze(0)
+        prompt_tok = tokenizer.encode(p)
+        idx = torch.tensor(prompt_tok, device=device).unsqueeze(0)
         with ctx:
             gen = eval_model.generate(idx, max_new,
                                       temp=0.8, top_k=50)
-        outs.append((p, tokenizer.decode(gen[0].tolist())))
+
+        new_tokens = gen[0, len(prompt_tok):].tolist()      # token‑level slice
+        outs.append((p, tokenizer.decode(new_tokens)))
     eval_model.train()
     return outs
 
 ruler_tasks = load_ruler_tasks() if ruler_eval_enabled else {}
 ruler_topk_values = [int(x) for x in ruler_topk_list.split(',')]
-
 coherency_prompts_list = [s.strip() for s in coherency_prompts.split(',')]
 
 # --------------------------------------------------------------------------
@@ -378,14 +369,12 @@ while True:
         if ddp: torch.distributed.barrier()
         losses = estimate_loss()
 
-        # RULER on every rank
         ruler_results = {}
         if ruler_eval_enabled and iter_num % ruler_eval_interval == 0:
             ruler_results = eval_ruler(ruler_tasks,
                                        ruler_topk_values,
                                        ruler_verbose and master_process)
 
-        # short‑context coherency
         coherency_out = []
         if coherency_eval_enabled and master_process:
             coherency_out = eval_coherency(
@@ -397,12 +386,10 @@ while True:
             print(f"iter {iter_num}: train {losses['train']:.4f}, "
                   f"val {losses['val']:.4f}")
 
-            # print coherency examples
             if coherency_out:
                 for p, g in coherency_out:
-                    print(f"[coherency] \"{p}\" → \"{g[len(p):50]}…\"")
+                    print(f"[coherency] \"{p}\" → \"{g[:50]}…\"")
 
-            # W&B logging --------------------------------------------------
             if enable_wandb:
                 log_dict = {
                     'iter':        iter_num,
@@ -410,13 +397,11 @@ while True:
                     'val/loss':    losses['val'],
                     'lr':          lr,
                 }
-                # ruler metrics
                 for k, res in ruler_results.items():
                     for tname, acc in res.items():
                         log_dict[f"ruler@k{k}/{tname}"] = acc
                 wandb.log(log_dict)
 
-            # checkpoints --------------------------------------------------
             if losses['val'] < best_val_loss or always_save_checkpoint:
                 best_val_loss = losses['val']
                 raw = model.module if ddp else model
@@ -448,7 +433,6 @@ while True:
     scaler.step(optimizer);  scaler.update()
     optimizer.zero_grad(set_to_none=True)
 
-    # ---- logging ---------------------------------------------------------
     toks_since_log += batch_size * train_seq_length * ddp_world_size
     if master_process and iter_num % log_interval == 0:
         dt = time.time() - t0
